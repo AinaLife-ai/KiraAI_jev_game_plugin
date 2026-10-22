@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>游戏 Agent</title>
+<style>
+  :root { --bg:#111418; --panel:#1a1f26; --border:#2a313a; --fg:#e6ebf2; --dim:#8b95a5; --acc:#4f9cf9; --ok:#3fb86b; --warn:#e5a13c; --err:#e05555; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { background:var(--bg); color:var(--fg); font:14px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif; padding:24px; }
+  h1 { font-size:20px; margin-bottom:4px; }
+  .sub { color:var(--dim); margin-bottom:20px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(340px,1fr)); gap:16px; }
+  .panel { background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:16px; }
+  .panel h2 { font-size:14px; color:var(--acc); margin-bottom:12px; text-transform:uppercase; letter-spacing:.04em; }
+  label { display:block; margin:10px 0 4px; color:var(--dim); font-size:12px; }
+  input, select, textarea { width:100%; background:#0e1216; color:var(--fg); border:1px solid var(--border); border-radius:6px; padding:8px 10px; font-size:13px; }
+  textarea { min-height:80px; font-family:ui-monospace,Menlo,Consolas,monospace; }
+  .row { display:flex; gap:8px; align-items:center; }
+  .row input[type=number] { width:100px; }
+  button { background:var(--acc); color:#fff; border:none; border-radius:6px; padding:9px 16px; font-size:13px; cursor:pointer; }
+  button:hover { filter:brightness(1.1); }
+  button.ghost { background:transparent; border:1px solid var(--border); color:var(--dim); }
+  button.save { margin-top:14px; width:100%; }
+  .pill { display:inline-block; padding:2px 10px; border-radius:20px; font-size:12px; }
+  .pill.ok { background:#17351f; color:var(--ok); }
+  .pill.err { background:#3a1c1c; color:var(--err); }
+  .pill.dim { background:#232a33; color:var(--dim); }
+  .status-line { margin-bottom:14px; }
+  pre { background:#0e1216; border:1px solid var(--border); border-radius:6px; padding:10px; font-size:12px; overflow:auto; max-height:260px; white-space:pre-wrap; }
+  .hint { color:var(--dim); font-size:12px; margin-top:4px; }
+  .ok { color:var(--ok); } .warn { color:var(--warn); } .err { color:var(--err); }
+  .chkrow { display:flex; flex-wrap:wrap; gap:6px 14px; margin:6px 0; }
+  .chk { display:flex; align-items:center; gap:4px; color:var(--fg); font-size:13px; margin:0; }
+  .chk input { width:auto; }
+</style>
+</head>
+<body>
+<h1>🎮 游戏 Agent</h1>
+<div class="sub">KiraAI × Jev 决策引擎 · 零 VLM · 状态来自游戏内部</div>
+
+<div class="grid">
+  <!-- status -->
+  <div class="panel">
+    <h2>状态</h2>
+    <div class="status-line">决策后端：<span id="backend_info" class="pill dim">—</span></div>
+    <div class="status-line">Laya 自动安装：<span id="laya_install" class="pill dim">—</span></div>
+    <div class="status-line">Jev key：<span id="key" class="pill dim">—</span></div>
+    <div class="status-line">Jev 统计：<span id="stats">—</span></div>
+    <div class="status-line">播报：<span id="notify_stats">—</span></div>
+    <h2 style="margin-top:20px">运行中的引擎（会话 × 游戏）</h2>
+    <div id="engines"><span class="pill dim">无</span></div>
+    <button class="ghost" style="margin-top:12px" onclick="loadStatus()">刷新</button>
+    <h2 style="margin-top:20px">最近事件</h2>
+    <pre id="events">—</pre>
+  </div>
+
+  <!-- jev config -->
+  <div class="panel">
+    <h2>决策引擎（Laya / Jev）</h2>
+    <label>决策后端（默认 laya，本地零成本）</label>
+    <select id="backend">
+      <option value="laya">Laya（本地开源，默认，零成本，支持中文）</option>
+      <option value="jev">Jev（TypeSafe 云端，需 key）</option>
+      <option value="kira_provider">KiraAI 已注册提供商（中转站等，复用其 key）</option>
+    </select>
+    <div id="kp_section" style="display:none">
+      <label>KiraAI 提供商（复用其 base_url + key）</label>
+      <select id="kira_provider_id"><option value="">（加载中…）</option></select>
+      <div class="hint">在 KiraAI「提供商」页注册中转站（如 futureppo.top）后，这里列出可选。选中即复用它的 base_url+api_key。</div>
+    </div>
+    <div id="laya_section" style="display:none">
+      <label class="row" style="align-items:center"><input type="checkbox" id="laya_autoinstall" style="width:auto"> 启动后自动安装+配置 laya</label>
+      <label>Laya HF 模型 ID</label>
+      <input type="text" id="laya_model" value="convaiinnovations/laya">
+      <label>checkpoint 子文件夹</label>
+      <select id="laya_subfolder">
+        <option value="multilingual">multilingual（100+ 语言，中文友好）</option>
+        <option value="english">english</option>
+        <option value="typed-decisions">typed-decisions</option>
+      </select>
+      <label>设备（留空自动）</label>
+      <input type="text" id="laya_device" placeholder="cuda / cpu">
+      <label>HF 镜像 (CN)</label>
+      <input type="text" id="laya_hf_mirror" placeholder="https://hf-mirror.com">
+      <label>本地模型路径（可选）</label>
+      <input type="text" id="laya_local_model_path" placeholder="/path/to/laya-dir">
+      <div class="hint">首次使用先运行：python scripts\install_laya.py 自动安装+下载模型</div>
+    </div>
+    <label>API Key（Jev 用，留空读环境变量）</label>
+    <input type="password" id="api_key" placeholder="TYPESAFE_API_KEY">
+    <label>模型</label>
+    <input type="text" id="model" value="jev-latest">
+    <label>Jev 自定义端点（自建/中转站/mock）</label>
+    <input type="text" id="base_url" placeholder="留空=官方 api.typesafe.ai">
+    <div class="row">
+      <div style="flex:1"><label>决策频率 (Hz)</label><input type="number" id="decision_hz" step="0.1" min="0.2" max="10"></div>
+      <div style="flex:1"><label>请求超时 (s)</label><input type="number" id="request_timeout" step="0.5" min="1"></div>
+    </div>
+    <div class="row">
+      <div style="flex:1"><label>意图 TTL (s)</label><input type="number" id="intent_ttl" step="0.1" min="0.3"></div>
+      <div style="flex:1"><label>采样温度</label><input type="number" id="temperature" step="0.1" min="0.5"></div>
+      <div style="flex:1"><label>目标概率下限</label><input type="number" id="goal_floor" step="0.01" min="0" max="1"></div>
+    </div>
+    </div>
+    <div class="row">
+      <div style="flex:1"><label>低风险阈值</label><input type="number" id="low_risk_threshold" step="0.05" min="0" max="1"></div>
+      <div style="flex:1"><label>高风险阈值</label><input type="number" id="high_risk_threshold" step="0.05" min="0" max="1"></div>
+    </div>
+    <label class="row" style="align-items:center"><input type="checkbox" id="use_baseline" style="width:auto"> 失败时用 baseline 降级</label>
+    <h2 style="margin-top:14px">关键决策征询（主 LLM）</h2>
+    <label class="row" style="align-items:center"><input type="checkbox" id="strategy_advisory" style="width:auto"> 关键阶段征询主 LLM 定战术</label>
+    <label class="row" style="align-items:center"><input type="checkbox" id="consult_ask_jev" style="width:auto"> 征询前先让引擎判是否值得</label>
+    <div class="row">
+      <div style="flex:1"><label>引擎判定关键度阈值</label><input type="number" id="consult_threshold" step="0.05" min="0" max="1"></div>
+      <div style="flex:1"><label>长对局周期征询(回合,0=关)</label><input type="number" id="strategy_interval_rounds" step="1" min="0"></div>
+    </div>
+    <button class="save" onclick="saveJev()">保存 Jev 设置（热生效）</button>
+  </div>
+
+  <!-- bridge config -->
+  <div class="panel">
+    <h2>游戏桥</h2>
+    <label>启用的游戏（勾选才向 LLM 注入对应专用工具）</label>
+    <div id="enabled_games" class="chkrow">
+      <label class="chk"><input type="checkbox" value="ygo_engine"> 游戏王 YGO</label>
+      <label class="chk"><input type="checkbox" value="pokemon_pyboy"> 宝可梦 PyBoy</label>
+      <label class="chk"><input type="checkbox" value="mgba_http"> 宝可梦 mGBA</label>
+      <label class="chk"><input type="checkbox" value="terrablind_http"> 泰拉瑞亚</label>
+      <label class="chk"><input type="checkbox" value="generic_http"> 通用 HTTP</label>
+    </div>
+    <label>游戏适配器</label>
+    <select id="game_sel">
+      <option value="none">（未选择）</option>
+      <option value="pokemon_pyboy">宝可梦 · PyBoy（进程内）</option>
+      <option value="mgba_http">宝可梦 · mGBA (HTTP)</option>
+      <option value="ygo_engine">游戏王 · YGOPro 引擎</option>
+      <option value="terrablind_http">泰拉瑞亚 · TerraBlind</option>
+      <option value="generic_http">通用 HTTP 桥</option>
+    </select>
+    <div class="row">
+      <div style="flex:1"><label>桥地址</label><input type="text" id="host" value="127.0.0.1"></div>
+      <div style="flex:1"><label>端口 (0=自动)</label><input type="number" id="port" min="0" max="65535"></div>
+    </div>
+    <label>PyBoy ROM 路径（宝可梦时）</label>
+    <input type="text" id="rom" placeholder="/path/to/pokemon-red.gb">
+    <div class="row">
+      <div style="flex:1"><label>轮询间隔 (s)</label><input type="number" id="poll_interval" step="0.5" min="0.5"></div>
+      <div style="flex:1"><label class="row" style="align-items:center;margin-top:24px"><input type="checkbox" id="auto_reconnect" style="width:auto"> 自动重连</label></div>
+    </div>
+    <label>停止关键词（每行一个，默认只有"停止玩宝可梦"）</label>
+    <textarea id="stop_keywords" style="min-height:50px" placeholder="停止玩宝可梦"></textarea>
+    <label>停止白名单（用户 ID，每行一个，空=所有人可说）</label>
+    <textarea id="stop_whitelist" style="min-height:50px" placeholder="123456&#10;789012"></textarea>
+    <label>工具粒度</label>
+    <select id="tool_granularity">
+      <option value="merged">merged（默认，只给合并工具，省 token）</option>
+      <option value="fine">fine（细分工具全开，更细粒度控制）</option>
+    </select>
+    <button class="save" onclick="saveBridge()">保存桥设置（热生效）</button>
+    <button class="ghost" style="width:100%;margin-top:8px" onclick="rebind()">立即重连桥</button>
+  </div>
+
+  <!-- playbook + strategy + notify -->
+  <div class="panel">
+    <h2>玩法知识 + 关键决策征询</h2>
+    <label>通用玩法说明书（注入每个决策）</label>
+    <textarea id="game_instructions"></textarea>
+    <label>分游戏背板 JSON（{"game": "打法说明"}）</label>
+    <textarea id="per_game_playbook" style="min-height:120px"></textarea>
+    <label>关键阶段征询映射 JSON（{"游戏": ["阶段"]}）</label>
+    <textarea id="enabled_stages" style="min-height:70px" placeholder='{"ygo_engine": ["dueling"], "pokemon_pyboy": ["battle"]}'></textarea>
+    <label>征询文案模板（{stage}/{summary} 占位）</label>
+    <textarea id="ask_templates" style="min-height:70px"></textarea>
+    <label class="row" style="align-items:center"><input type="checkbox" id="notify_enabled" style="width:auto"> 主动播报游戏事件</label>
+    <label>播报会话（每行一个 sid，如 qq:gm:12345）</label>
+    <textarea id="notify_sids" style="min-height:60px"></textarea>
+    <div class="row">
+      <div style="flex:1"><label>最短播报间隔 (s)</label><input type="number" id="notify_min_interval" step="5" min="1"></div>
+    </div>
+    <button class="save" onclick="savePlaybook()">保存知识/征询/播报（热生效）</button>
+  </div>
+</div>
+
+<script>
+const API = "/api/plugin/KiraAI_jev_game_plugin";
+
+async function j(method, path, body) {
+  const opt = { method, headers: { "Content-Type": "application/json" } };
+  if (body !== undefined) opt.body = JSON.stringify(body);
+  const r = await fetch(API + path, opt);
+  return r.json();
+}
+
+function el(id) { return document.getElementById(id); }
+
+async function loadStatus() {
+  try {
+    const s = await j("GET", "/status");
+    const st = s.engines || {};
+    const keys = Object.keys(st);
+    const box = document.getElementById("engines");
+    if (!keys.length) {
+      box.innerHTML = '<span class="pill dim">无运行中的引擎</span>';
+    } else {
+      box.innerHTML = keys.map(k => {
+        const e = st[k] || {};
+        const run = e.running;
+        return `<div class="status-line" style="border:1px solid var(--border);border-radius:8px;padding:8px;margin-bottom:8px">
+          <b>${k}</b> <span class="pill ${run ? "ok" : "dim"}">${run ? "运行中" : "已暂停"}</span><br>
+          <span style="color:var(--dim);font-size:12px">循环 ${e.loop_count||0} · 目标: ${e.goal || "—"} · 最近动作: ${e.last_action || "—"}</span>
+        </div>`;
+      }).join("");
+    }
+    const keyPill = document.getElementById("key");
+    keyPill.textContent = s.engine_key ? "已配置" : "未配置";
+    keyPill.className = "pill " + (s.engine_key ? "ok" : "err");
+    // backend indicator
+    const bi = document.getElementById("backend_info");
+    // autoinstall progress
+    const ai = document.getElementById("laya_install");
+    if (s.autoinstall && s.autoinstall.state) {
+      const st = s.autoinstall.state;
+      const map = { idle: ["待命", "dim"], installing: ["安装 laya…", "warn"], download: ["下载模型…", "warn"], ready: ["已就绪", "ok"], error: ["失败", "err"], cancelled: ["已取消", "dim"] };
+      const [txt, cls] = map[st] || [st, "dim"];
+      ai.textContent = txt;
+      ai.className = "pill " + cls;
+      ai.title = (s.autoinstall.msg || "") + (s.autoinstall.steps || []).join(" | ");
+    } else {
+      ai.textContent = "—";
+      ai.className = "pill dim";
+    }
+    if (s.backend && s.backend.name === "laya") {
+      const loaded = s.backend.laya_loaded;
+      bi.textContent = loaded ? "Laya · 本地已加载" : "Laya · 模型未加载（自动安装中…）";
+      bi.className = "pill " + (loaded ? "ok" : "warn");
+      if (s.backend.laya_error) bi.title = s.backend.laya_error;
+    } else {
+      bi.textContent = "Jev · 云端";
+      bi.className = "pill ok";
+    }
+    document.getElementById("stats").textContent = s.jev_stats || "—";
+    const ns = s.notify || {};
+    document.getElementById("notify_stats").textContent = `队列 ${ns.queued||0} · 已发 ${ns.sent||0} · 丢弃 ${ns.dropped||0}`;
+    document.getElementById("events").textContent = (s.events || []).slice(-15).map(ev => `${new Date(ev.at*1000).toLocaleTimeString()} [${ev.engine}] ${ev.kind}: ${JSON.stringify(ev.payload)}`).join("\n") || "—";
+  } catch (e) { document.getElementById("events").textContent = "loadStatus 失败: " + e; }
+}
+
+async function loadConfig() {
+  try {
+    const c = await j("GET", "/config");
+    const jev = c.section_jev || {}, br = c.section_bridge || {}, pb = c.section_playbook || {}, n = c.section_notify || {}, la = c.section_laya || {}, st = c.section_strategy || {};
+    el("backend").value = jev.backend || "laya";
+    el("backend").addEventListener("change", toggleLaya);
+    el("kira_provider_id").value = jev.kira_provider_id || "";
+    toggleLaya();
+    if ((jev.backend || "") === "kira_provider") loadProviders();
+    el("api_key").value = jev.api_key || "";
+    el("model").value = jev.model || "jev-latest";
+    el("laya_model").value = la.laya_model || la.model || "convaiinnovations/laya";
+    el("laya_subfolder").value = la.laya_subfolder || la.subfolder || "multilingual";
+    el("laya_device").value = la.laya_device || la.device || "";
+    el("laya_hf_mirror").value = la.laya_hf_mirror || la.hf_mirror || "";
+    el("laya_local_model_path").value = la.laya_local_model_path || la.local_model_path || "";
+    el("laya_autoinstall").checked = (la.laya_autoinstall ?? la.autoinstall) !== false;
+    el("decision_hz").value = jev.decision_hz ?? 1.0;
+    el("request_timeout").value = jev.request_timeout ?? 5.0;
+    el("intent_ttl").value = jev.intent_ttl ?? 1.5;
+    el("temperature").value = jev.temperature ?? 2.0;
+    el("goal_floor").value = jev.goal_floor ?? 0.1;
+    el("base_url").value = jev.base_url || "";
+    el("low_risk_threshold").value = jev.low_risk_threshold ?? 0.55;
+    el("high_risk_threshold").value = jev.high_risk_threshold ?? 0.85;
+    el("use_baseline").checked = !!jev.use_baseline;
+    el("strategy_advisory").checked = jev.strategy_advisory !== false;
+    el("consult_ask_jev").checked = jev.consult_ask_jev !== false;
+    el("consult_threshold").value = jev.consult_threshold ?? 0.6;
+    el("strategy_interval_rounds").value = jev.strategy_interval_rounds ?? 8;
+    el("game_sel").value = br.game || "none";
+    // enabled_games checkboxes
+    const enabled = br.enabled_games || [];
+    document.querySelectorAll("#enabled_games input[type=checkbox]").forEach(cb => {
+      cb.checked = enabled.includes(cb.value);
+    });
+    el("host").value = br.host || "127.0.0.1";
+    el("port").value = br.port ?? 17878;
+    el("rom").value = br.rom || "";
+    el("poll_interval").value = br.poll_interval ?? 2.0;
+    el("auto_reconnect").checked = br.auto_reconnect !== false;
+    el("stop_keywords").value = (br.stop_keywords || ["停止玩宝可梦"]).join("\n");
+    el("stop_whitelist").value = (br.stop_whitelist || []).join("\n");
+    el("tool_granularity").value = br.tool_granularity || "merged";
+    el("game_instructions").value = pb.game_instructions || "";
+    el("per_game_playbook").value = JSON.stringify(pb.per_game_playbook || {}, null, 2);
+    el("enabled_stages").value = JSON.stringify(st.enabled_stages || {}, null, 2);
+    el("ask_templates").value = st.ask_templates || "";
+    el("notify_enabled").checked = n.notify_enabled !== false;
+    el("notify_sids").value = (n.notify_sids || []).join("\n");
+    el("notify_min_interval").value = n.notify_min_interval ?? 30;
+  } catch (e) { console.error(e); }
+}
+
+async function saveSection(build) {
+  const c = await j("GET", "/config");
+  const patch = build(c);
+  // merge: shallow-merge the patched sections
+  const merged = { ...c, ...patch };
+  const r = await j("POST", "/config", merged);
+  alert(r.message || (r.ok ? "已保存" : "保存失败"));
+  loadStatus();
+}
+
+function toggleLaya() {
+  const v = el("backend").value;
+  el("laya_section").style.display = v === "laya" ? "" : "none";
+  el("kp_section").style.display = v === "kira_provider" ? "" : "none";
+  if (v === "kira_provider") loadProviders();
+}
+
+async function loadProviders() {
+  try {
+    const d = await j("GET", "/providers");
+    const sel = el("kira_provider_id");
+    const cur = sel.value;
+    sel.innerHTML = '<option value="">（未选择）</option>' +
+      (d.providers || []).map(p => `<option value="${p.id}" ${p.id === cur ? "selected" : ""}>${p.name} · ${p.base_url || "官方"} ${p.has_key ? "🔑" : "⚠️无key"}</option>`).join("");
+  } catch (e) { console.error(e); }
+}
+
+function saveJev() {
+  saveSection(c => ({
+    section_jev: {
+      ...c.section_jev,
+      backend: el("backend").value,
+      kira_provider_id: el("kira_provider_id").value,
+      api_key: el("api_key").value,
+      model: el("model").value,
+      decision_hz: parseFloat(el("decision_hz").value),
+      request_timeout: parseFloat(el("request_timeout").value),
+      intent_ttl: parseFloat(el("intent_ttl").value),
+      temperature: parseFloat(el("temperature").value),
+      goal_floor: parseFloat(el("goal_floor").value) || 0.1,
+      base_url: el("base_url").value,
+      low_risk_threshold: parseFloat(el("low_risk_threshold").value),
+      high_risk_threshold: parseFloat(el("high_risk_threshold").value),
+      use_baseline: el("use_baseline").checked,
+      strategy_advisory: el("strategy_advisory").checked,
+      consult_ask_jev: el("consult_ask_jev").checked,
+      consult_threshold: parseFloat(el("consult_threshold").value) || 0.6,
+      strategy_interval_rounds: parseInt(el("strategy_interval_rounds").value, 10) || 8,
+    },
+    section_laya: {
+      ...c.section_laya,
+      autoinstall: el("laya_autoinstall").checked,
+      model: el("laya_model").value,
+      subfolder: el("laya_subfolder").value,
+      device: el("laya_device").value,
+      laya_hf_mirror: el("laya_hf_mirror").value,
+      laya_local_model_path: el("laya_local_model_path").value,
+    },
+  }));
+}
+function saveBridge() {
+  const enabled = [...document.querySelectorAll("#enabled_games input[type=checkbox]:checked")].map(cb => cb.value);
+  saveSection(c => ({
+    section_bridge: {
+      ...c.section_bridge,
+      enabled_games: enabled,
+      stop_keywords: el("stop_keywords").value.split("\n").map(s => s.trim()).filter(Boolean),
+      stop_whitelist: el("stop_whitelist").value.split("\n").map(s => s.trim()).filter(Boolean),
+      tool_granularity: el("tool_granularity").value,
+      game: el("game_sel").value,
+      host: el("host").value,
+      port: parseInt(el("port").value, 10),
+      rom: el("rom").value,
+      poll_interval: parseFloat(el("poll_interval").value),
+      auto_reconnect: el("auto_reconnect").checked,
+    },
+  }));
+}
+function savePlaybook() {
+  let per = {};
+  try { per = JSON.parse(el("per_game_playbook").value || "{}"); }
+  catch (e) { alert("分游戏背板不是合法 JSON"); return; }
+  let stages = {};
+  try { stages = JSON.parse(el("enabled_stages").value || "{}"); }
+  catch (e) { alert("关键阶段映射不是合法 JSON"); return; }
+  saveSection(c => ({
+    section_playbook: {
+      ...c.section_playbook,
+      game_instructions: el("game_instructions").value,
+      per_game_playbook: per,
+    },
+    section_strategy: {
+      ...c.section_strategy,
+      enabled_stages: stages,
+      ask_templates: el("ask_templates").value,
+    },
+    section_notify: {
+      ...c.section_notify,
+      notify_enabled: el("notify_enabled").checked,
+      notify_sids: el("notify_sids").value.split("\n").map(s => s.trim()).filter(Boolean),
+      notify_min_interval: parseFloat(el("notify_min_interval").value),
+    },
+  }));
+}
+async function rebind() {
+  const r = await j("POST", "/config", await j("GET", "/config"));
+  alert(r.message || "已触发重连");
+  loadStatus();
+}
+
+loadConfig(); loadStatus();
+setInterval(loadStatus, 5000);
+</script>
+</body>
+</html>

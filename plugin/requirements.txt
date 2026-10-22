@@ -1,0 +1,4 @@
+requests>=2.31
+# 本地决策后端 laya（可选，零成本/支持中文）：https://github.com/NandhaKishorM/laya
+# 用 WebUI「决策后端=laya」时需安装 + 下载模型（可运行 scripts/install_laya.py 自动完成）
+# laya>=0.3.5  # 依赖 torch/transformers，建议用 install_laya.py 安装避免环境冲突

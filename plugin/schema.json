@@ -1,0 +1,295 @@
+{
+  "info_intro": {
+    "type": "info",
+    "name": "说明",
+    "hint": "游戏 Agent：KiraAI × Jev 决策引擎。零 VLM——状态全部来自游戏内部（模拟器内存/引擎状态/游戏 mod），Jev 每轮做类型化决策，代码执行动作。",
+    "level": "info"
+  },
+  "section_jev": {
+    "type": "section",
+    "name": "决策引擎",
+    "collapsed": false,
+    "fields": {
+      "backend": {
+        "type": "enum",
+        "name": "决策后端",
+        "options": ["laya", "jev", "kira_provider"],
+        "default": "laya",
+        "hint": "laya=本地开源引擎（零成本、支持中文、开箱即用）；jev=TypeSafe 云 API（需 key）；kira_provider=复用 KiraAI 已注册的提供商（如 futureppo.top 中转站，填其 base_url+key）"
+      },
+      "kira_provider_id": {
+        "type": "string",
+        "name": "KiraAI 已注册提供商",
+        "default": "",
+        "hint": "当决策后端=kira_provider 时必填：填 KiraAI 提供商页里已注册的 provider ID（如 openai-official / custom-futureppo）。插件读它的 base_url+api_key 调 systemone 接口"
+      },
+      "api_key": {
+        "type": "sensitive",
+        "name": "TypeSafe API Key",
+        "default": "",
+        "hint": "留空则读环境变量 TYPESAFE_API_KEY（console.typesafe.ai 获取）"
+      },
+      "model": {
+        "type": "string",
+        "name": "模型",
+        "default": "jev-latest",
+        "hint": "jev-latest = jev-1.13.0"
+      },
+      "base_url": {
+        "type": "string",
+        "name": "Jev 端点",
+        "default": "",
+        "hint": "留空=官方 api.typesafe.ai；自建/兼容端点/本地 mock 时填（如 http://127.0.0.1:17889）"
+      },
+      "decision_hz": {
+        "type": "float",
+        "name": "决策频率 (Hz)",
+        "default": 2.0,
+        "minimum": 0.2,
+        "maximum": 10,
+        "hint": "每秒 Jev 决策次数。实时动作(泰拉瑞亚/马里奥)建议 5，回合制(宝可梦/游戏王)建议 0.5-1"
+      },
+      "request_timeout": {
+        "type": "float",
+        "name": "请求超时 (秒)",
+        "default": 5.0,
+        "hint": "单次 Jev 请求超时"
+      },
+      "intent_ttl": {
+        "type": "float",
+        "name": "意图 TTL (秒)",
+        "default": 1.5,
+        "hint": "决策结果超过 TTL 未刷新则回退保守 baseline（TerraBlind 经验：过期判断比没有更糟）"
+      },
+      "low_risk_threshold": {
+        "type": "float",
+        "name": "低风险置信度阈值",
+        "default": 0.55,
+        "hint": "低风险动作(走位/确认)低于此置信度则回退安全默认"
+      },
+      "high_risk_threshold": {
+        "type": "float",
+        "name": "高风险置信度阈值",
+        "default": 0.85,
+        "hint": "高风险动作(自杀式冲锋/重大操作)需高于此置信度才执行"
+      },
+      "use_baseline": {
+        "type": "switch",
+        "name": "失败时用 baseline 降级",
+        "default": true,
+        "hint": "Jev 无 key/超时/失败时用保守规则决策，而不是停摆"
+      },
+      "temperature": {
+        "type": "float",
+        "name": "目标采样温度",
+        "default": 2.0,
+        "hint": ">1 展平目标概率分布防卡死（jev-plays-pokemon 经验：p=0.99 的自信误判会每回合重复）"
+      },
+      "goal_floor": {
+        "type": "float",
+        "name": "目标概率下限",
+        "default": 0.1,
+        "hint": "每个目标至少保留的概率质量，防止某个目标垄断"
+      },
+      "strategy_advisory": {
+        "type": "switch",
+        "name": "关键阶段征询主 LLM",
+        "default": true,
+        "hint": "进入关键阶段(如 YGO 对局开始/宝可梦战斗)时，让主 LLM 定战术目标（搭车互动）。关闭则 Jev/laya 全权主导"
+      },
+      "consult_ask_jev": {
+        "type": "switch",
+        "name": "让引擎判是否需征询",
+        "default": true,
+        "hint": "征询前先问 Jev/laya『当前是否值得打扰主 LLM』，超过阈值才征询。更智能省打扰"
+      },
+      "consult_threshold": {
+        "type": "float",
+        "name": "征询关键度阈值",
+        "default": 0.6,
+        "minimum": 0,
+        "maximum": 1,
+        "hint": "当 consult_ask_jev 开启时，Jev/laya 判断的『关键度』高于此值才征询主 LLM"
+      },
+      "strategy_interval_rounds": {
+        "type": "integer",
+        "name": "长对局周期征询(回合)",
+        "default": 8,
+        "minimum": 2,
+        "hint": "长对局(如 YGO 决斗/宝可梦战斗)每 N 回合再征询一次，让主 LLM 调整中期打法；0=关闭周期征询只阶段触发"
+      }
+    }
+  },
+  "section_strategy": {
+    "type": "section",
+    "name": "关键决策征询（主 LLM）",
+    "collapsed": true,
+    "fields": {
+      "enabled_stages": {
+        "type": "json",
+        "name": "需要征询的阶段映射",
+        "default": {"ygo_engine": ["dueling"], "pokemon_pyboy": ["battle"], "mgba_http": ["battle"], "terrablind_http": ["boss", "crafting"]},
+        "hint": "每游戏: 进这些阶段触发征询。JSON 对象 {游戏: [阶段列表]}。例 {\"ygo_engine\": [\"dueling\"]}"
+      },
+      "ask_templates": {
+        "type": "markdown",
+        "name": "征询文案模板",
+        "default": "游戏进入关键阶段【{stage}】。当前局面：{summary}\n请制定本次战术目标（如『主打进攻/先防守拉资源/优先躲』），或直接用 game_set_goal 设定目标。",
+        "hint": "发给主 LLM 的征询模板，{stage}/{summary} 为占位符。改这里可定制互动语气"
+      }
+    }
+  },
+  "section_bridge": {
+    "type": "section",
+    "name": "游戏桥",
+    "collapsed": false,
+    "fields": {
+      "enabled_games": {
+        "type": "multi_select",
+        "name": "启用的游戏（按需注入对应工具）",
+        "options": ["pokemon_pyboy", "mgba_http", "ygo_engine", "terrablind_http", "generic_http"],
+        "default": ["ygo_engine", "pokemon_pyboy"],
+        "hint": "勾选的游戏才会向 LLM 注入对应专用工具（game_ygo_* / game_pkm_* 等）。未勾选的不注入，工具表干净"
+      },
+      "stop_keywords": {
+        "type": "list",
+        "name": "停止关键词",
+        "default": ["停止玩宝可梦"],
+        "hint": "用户在群里说这些词时停止当前游戏（默认只有'停止玩宝可梦'）。白名单内用户说才生效"
+      },
+      "stop_whitelist": {
+        "type": "list",
+        "name": "停止白名单（用户 ID）",
+        "default": [],
+        "hint": "只有这些用户 ID 说停止关键词才触发停止。留空 = 所有人可说。格式与 sid 一致，如 QQ 号 123456"
+      },
+      "tool_granularity": {
+        "type": "enum",
+        "name": "工具粒度",
+        "options": ["merged", "fine"],
+        "default": "merged",
+        "hint": "merged=只给合并工具（game_play/control/inspect/direct，省 token）；fine=细分工具全开（game_state/logs/diag/command/set_goal/jev_ask/pause/resume/stop 单独）"
+      },
+      "game": {
+        "type": "enum",
+        "name": "游戏适配器",
+        "options": ["none", "pokemon_pyboy", "mgba_http", "ygo_engine", "terrablind_http", "generic_http"],
+        "default": "none",
+        "hint": "选择要玩的游戏。pokemon_pyboy=进程内 PyBoy；mgba_http=mGBA+HTTP 桥；ygo_engine=YGOPro 引擎(支持网络对战)；terrablind_http=泰拉瑞亚 mod；generic_http=任意 HTTP 状态+动作服务"
+      },
+      "host": {
+        "type": "string",
+        "name": "桥地址",
+        "default": "127.0.0.1",
+        "hint": "外部桥（mGBA-http/TerraBlind/generic）的地址"
+      },
+      "port": {
+        "type": "integer",
+        "name": "桥端口",
+        "default": 17878,
+        "minimum": 0,
+        "hint": "0 = 自动探测常见端口（17878/5000/8080…）"
+      },
+      "poll_interval": {
+        "type": "float",
+        "name": "事件轮询间隔 (秒)",
+        "default": 2.0,
+        "hint": "低频轮询桥状态，检测显著变化并触发主动播报"
+      },
+      "auto_reconnect": {
+        "type": "switch",
+        "name": "自动重连",
+        "default": true,
+        "hint": "桥断开后指数退避重连（0.5/1/2/5 分钟）"
+      }
+    }
+  },
+  "section_playbook": {
+    "type": "section",
+    "name": "玩法知识 (Playbook)",
+    "collapsed": true,
+    "fields": {
+      "game_instructions": {
+        "type": "markdown",
+        "name": "通用玩法说明书",
+        "default": "You are an AI playing a video game. Read the game state and decide the best action. Code executes your decisions. Prefer progress toward the current goal. When unsure, choose the safe default.",
+        "hint": "注入每个决策的通用玩法说明（建议英文，Jev 英文精度最高）"
+      },
+      "per_game_playbook": {
+        "type": "json",
+        "name": "分游戏背板",
+        "default": {},
+        "hint": "{\"pokemon_pyboy\": \"...\", \"ygo_engine\": \"...\"} 每游戏一段话：怎么玩、目标、禁忌。加内容不写代码"
+      }
+    }
+  },
+  "section_laya": {
+    "type": "section",
+    "name": "Laya 本地后端",
+    "collapsed": true,
+    "fields": {
+      "laya_autoinstall": {
+        "type": "switch",
+        "name": "自动安装+配置（用户点了才装）",
+        "default": false,
+        "hint": "默认关：插件启动不自动装 laya。用户在前端打开此开关后，才会自动后台 pip 装 laya + 下载模型（不阻塞）。或手动运行 scripts/install_laya.py"
+      },
+      "laya_model": {
+        "type": "string",
+        "name": "HuggingFace 模型 ID",
+        "default": "convaiinnovations/laya",
+        "hint": "模型仓库 ID：convaiinnovations/laya"
+      },
+      "laya_subfolder": {
+        "type": "enum",
+        "name": "checkpoint 子文件夹",
+        "options": ["multilingual", "english", "typed-decisions"],
+        "default": "multilingual",
+        "hint": "multilingual=100+ 语言（含中文，游戏推荐）；english=英文更准；typed-decisions=复杂决策工作流"
+      },
+      "laya_device": {
+        "type": "string",
+        "name": "设备",
+        "default": "",
+        "hint": "留空=自动（有 GPU 用 cuda，否则 cpu）；可填 cuda / cpu"
+      },
+      "laya_hf_mirror": {
+        "type": "string",
+        "name": "HF 镜像 (CN)",
+        "default": "",
+        "hint": "国内下载模型慢/失败填 https://hf-mirror.com"
+      },
+      "laya_local_model_path": {
+        "type": "string",
+        "name": "本地模型路径",
+        "default": "",
+        "hint": "已手动下载模型的本地目录路径（留空则用 HF 自动下载缓存）"
+      }
+    }
+  },
+  "section_notify": {
+    "type": "section",
+    "name": "主动播报",
+    "collapsed": true,
+    "fields": {
+      "notify_enabled": {
+        "type": "switch",
+        "name": "游戏事件主动播报",
+        "default": true,
+        "hint": "关键事件(战斗升级/目标完成/卡死/危险)主动发给用户"
+      },
+      "notify_sids": {
+        "type": "list",
+        "name": "播报会话",
+        "default": [],
+        "hint": "格式 qq:gm:群号 / telegram:uid:用户id 等；留空不播报"
+      },
+      "notify_min_interval": {
+        "type": "float",
+        "name": "最短播报间隔 (秒)",
+        "default": 30.0,
+        "hint": "防止刷屏：同类事件至少间隔这么久才再播"
+      }
+    }
+  }
+}
