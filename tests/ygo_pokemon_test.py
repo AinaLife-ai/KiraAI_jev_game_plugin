@@ -71,18 +71,28 @@ def test_ygo_state():
     qs = build_ygo_questions(snap, goal="win")
     check("next_action present", "next_action" in qs)
     check("next_action is choice", qs["next_action"]["type"] == "choice")
-    check("next_action has legal options", "summon" in qs["next_action"]["criteria"])
-    check("danger present", "danger" in qs)
-    check("should_attack present (my turn)", "should_attack" in qs)
-    check("should_change_plan absent (my turn, not blocked)", "should_change_plan" not in qs)
+    criteria = qs["next_action"]["criteria"]
+    # Option ids, not action names: 5 legal options -> 5 distinct choices
+    # (previously same-named actions overwrote each other in the dict).
+    check("criteria keyed by option id", set(criteria) == {"0", "1", "2", "3", "4"}, str(set(criteria)))
+    check("no same-action overwrite", len(criteria) == len(snap["game"]["legal_actions"]))
+    check("criteria keep card semantics", any("Mystic Tomato" in v for v in criteria.values()))
+    check("goal forwarded to instructions", "win" in qs["next_action"]["instructions"])
+    # One question per decision: unused danger/should_attack/plan questions
+    # were removed (their answers were never consumed = wasted tokens).
+    check("single question per decision (token optimal)", list(qs) == ["next_action"], str(list(qs)))
 
-    # opponent's turn -> interaction questions
+    # opponent's turn -> same single option-choice question
     snap2 = dict(snap)
     snap2["game"] = dict(snap["game"])
     snap2["game"]["is_my_turn"] = False
     qs2 = build_ygo_questions(snap2)
-    check("should_change_plan present (opponent turn)", "should_change_plan" in qs2)
-    check("is_countered present (opponent turn)", "is_countered" in qs2)
+    check("opponent turn still option-driven", list(qs2) == ["next_action"], str(list(qs2)))
+    snap3 = {"game": {"legal_actions": [{"action": "pass"}, {"action": "activate", "card": "Mirror Force"}],
+                      "response_window": True, "is_my_turn": False}}
+    qs3 = build_ygo_questions(snap3)
+    check("response window instructions", "response" in qs3["next_action"]["instructions"].lower())
+    check("no legal options -> no question", build_ygo_questions({"game": {"legal_actions": []}}) == {})
 
 
 def test_adventure_log():

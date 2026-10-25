@@ -145,11 +145,15 @@ def build_ygo_state(
         "is_duel_active": bool(g.get("is_duel_active", True)),
     }
 
-    # --- legal actions (the decision space, with effect descriptions) ---
-    legal = g.get("legal_actions", [])
+    # --- legal options (the decision space, addressed by option id) ---
+    from ..ygo_ops import options_map
+    legal = options_map(g)
     state["legal_actions"] = []
-    for a in legal[:25]:  # trim to 25 to keep state compact
+    for i, (oid, a) in enumerate(legal.items()):
+        if i >= 25:  # trim to 25 to keep state compact
+            break
         brief = {
+            "option": oid,
             "action": a.get("action", a.get("type", "?")),
         }
         if a.get("card"):
@@ -175,90 +179,55 @@ def build_ygo_state(
 
     # --- harness memory (recent decisions + hints) ---
     if recent_actions:
-        state["recent_actions"] = list(recent_actions)[-12:]
+        state["recent_actions"] = list(recent_actions)[-6:]
     if recent_hints:
-        state["recent_hints"] = list(recent_hints)[-8:]
+        state["recent_hints"] = list(recent_hints)[-4:]
 
     return state
 
 
 def build_ygo_questions(snapshot: dict[str, Any], goal: str = "") -> dict[str, Any]:
-    """YGO-specific Jev questions for duel decisions.
+    """YGO-specific Jev question: exactly one choice per decision.
 
-    Covers:
-    - next_action: Choice over the legal actions (the main decision).
-    - danger: Score (how threatened we are).
-    - should_use_effect: Noul (is this a good moment to use a key effect).
-    - should_attack: Noul (is direct/safe attack worth it now).
-    - is_my_plan_working: Noul (is the current strategy progressing).
+    ``next_action`` is a Choice whose criteria keys are **option ids** (bridge
+    id or list index). The engine resolves the chosen id back to the same
+    legal option before executing, so same-named actions never collide and a
+    stale answer is skipped instead of misfiring.
+
+    No legal options -> no question at all (the caller skips the request).
     """
     g = snapshot.get("game", {}) if isinstance(snapshot, dict) else {}
-    legal = g.get("legal_actions", [])
-    is_my_turn = bool(g.get("is_my_turn", True))
+    from ..ygo_ops import describe_option, options_map
+    legal = options_map(g)
 
-    # Build the choice criteria from legal actions (with effect descriptions).
+    # Criteria are keyed by **option id**, not by action name: five different
+    # summonable monsters must remain five distinct choices, and the chosen
+    # id resolves back to the exact same option at execution time.
     criteria = {}
-    for a in legal[:20]:
-        key = a.get("action", a.get("type", "?"))
-        desc_parts = []
-        if a.get("card"):
-            desc_parts.append(str(a.get("card")))
-        if a.get("position"):
-            desc_parts.append(str(a.get("position")))
-        eff = _effect_of(str(a.get("card", "")), a if isinstance(a, dict) else None)
-        if eff:
-            desc_parts.append(eff)
-        if a.get("desc"):
-            desc_parts.append(str(a.get("desc"))[:60])
-        criteria[key] = " / ".join(desc_parts) if desc_parts else key
+    for i, (oid, a) in enumerate(legal.items()):
+        if i >= 25:
+            break
+        text = describe_option(oid, a, with_effect=True)
+        prefix = f"#{oid} "
+        criteria[oid] = text[len(prefix):] if text.startswith(prefix) else text
 
+    # One question only: pick the next legal option. The previous version
+    # asked 5-7 questions per tick (danger/should_attack/plan_working/…)
+    # whose answers were never consumed — pure token waste.
     questions: dict[str, Any] = {}
     if criteria:
+        goal_hint = f" Current goal: {goal}." if goal else ""
+        response = bool(g.get("response_window"))
         questions["next_action"] = {
             "type": "choice",
             "instructions": (
-                "You are playing Yu-Gi-Oh! and must pick the best legal action now. "
-                "Consider LP, field control, resources, and your strategy."
+                "You are playing Yu-Gi-Oh!. Pick the best legal option by its id. "
+                + ("The opponent is waiting for YOUR response: chain a card or pass. "
+                   if response else
+                   "Consider LP, field control, resources and card effects; on the "
+                   "opponent's turn only respond when it helps. ")
+                + "Answer with the option id exactly as listed." + goal_hint
             ),
             "criteria": criteria,
-        }
-    questions["danger"] = {
-        "type": "score",
-        "instructions": "How dangerous is the current situation for us? Higher = more threatened.",
-        "criteria": [
-            "safe, we control the board",
-            "okay, some pressure",
-            "risky, we are losing ground",
-            "dangerous, we could lose soon",
-            "critical, we will lose if we don't act",
-        ],
-    }
-    questions["should_use_effect"] = {
-        "type": "noul",
-        "instructions": "Is this a good moment to use a key monster/spell/trap effect now?",
-    }
-    if is_my_turn:
-        questions["should_attack"] = {
-            "type": "noul",
-            "instructions": "Should we attack now (including direct attack)?",
-        }
-        questions["should_set_or_summon"] = {
-            "type": "noul",
-            "instructions": "Should we focus on building board (summon/set) rather than attacking?",
-        }
-    questions["is_my_plan_working"] = {
-        "type": "noul",
-        "instructions": "Is our current strategy progressing well (we are gaining advantage)?",
-    }
-    # "被拦时怎么办" — when our plan is countered/blocked, decide whether to
-    # switch tactics or keep pushing.
-    if g.get("plan_blocked") or not g.get("is_my_turn", True):
-        questions["should_change_plan"] = {
-            "type": "noul",
-            "instructions": "Our plan seems blocked or the opponent has countered. Should we change tactics now?",
-        }
-        questions["is_countered"] = {
-            "type": "noul",
-            "instructions": "Has the opponent effectively countered our current strategy (negated key effects, cleared our board)?",
         }
     return questions

@@ -33,6 +33,7 @@ from .jev.questions import (
 from .jev.state_builder import StateBuilder
 from .stages import STAGE_LISTS, StageMachine
 from .escalate import Escalator
+from .ygo_ops import act_payload, match_action, options_map, resolve_option
 
 log = logging.getLogger("kira_game_agent.engine")
 
@@ -64,6 +65,7 @@ class DecisionEngine:
         consult_ask_jev: bool = True,
         consult_threshold: float = 0.6,
         strategy_advisory: bool = True,
+        auto_decision: bool = True,
     ) -> None:
         self.adapter = adapter
         self.client = client
@@ -74,6 +76,14 @@ class DecisionEngine:
         self.consult_ask_jev = consult_ask_jev
         self.consult_threshold = consult_threshold
         self.strategy_advisory = strategy_advisory
+        # auto_decision=False -> the main LLM plays through tools; the loop
+        # only keeps the snapshot cache/stage fresh and asks for input.
+        self.auto_decision = auto_decision
+        self.cached_snapshot: dict = {}
+        self._backend_ok = False
+        self._backend_checked_at = 0.0
+        self._last_input_fingerprint = ""
+        self._last_input_prompt_at = 0.0
         self._strategy_round_counter = 0
         self._strategy_consulted_stages: set[str] = set()
         self.gate = gate
@@ -92,10 +102,9 @@ class DecisionEngine:
         self._last_decision_at = 0.0
         self._last_action = ""
         self._last_action_at = 0.0
-        # Pre-input action chain: Jev can plan a short sequence of legal
-        # actions; we execute them without re-deciding unless interrupted.
-        self._action_chain: list[str] = []
-        self._chain_snapshot_hash: str = ""
+        # Pre-input chain: planned legal options (semantic dicts) executed
+        # while they still match the live legal list.
+        self._action_chain: list[dict] = []
         self._loop_count = 0
         self.recent_decisions: list[dict] = []  # ring buffer, newest last
         self.game = game
@@ -118,17 +127,45 @@ class DecisionEngine:
             self._request_strategy_consult(new)
 
     def _request_strategy_consult(self, stage_name: str) -> None:
-        """Trigger a main-LLM strategic consult for a stage entry.
-        Runs only if strategy_advisory is enabled."""
+        """Schedule a main-LLM strategic consult (never blocks the loop).
+
+        The optional Jev/laya gate runs in a worker thread; without a
+        backend we consult directly — the main LLM *is* the strategist.
+        """
         if not getattr(self, "strategy_advisory", True):
             return
         if self.advisory is None or self.adapter is None:
             return
         try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # No event loop (offline/unit-test context): run inline. Inside
+            # the decision loop there is always a running loop, so this path
+            # can never stall KiraAI.
+            self._strategy_consult_inline(stage_name)
+            return
+        loop.create_task(self._strategy_consult_async(stage_name))
+
+    def _strategy_consult_inline(self, stage_name: str) -> None:
+        try:
             snap = self.adapter.get_state() or {}
-            # Optional engine gate: does Jev/laya think this is strategic enough?
-            if self.consult_ask_jev and self.client is not None:
-                gate_ok = self._consult_gate(snap, stage_name)
+            if self.consult_ask_jev and self.client is not None and self._backend_available():
+                if not self._consult_gate(snap, stage_name):
+                    if self.on_event:
+                        self.on_event("strategy_skipped", {"stage": stage_name})
+                    return
+            self.advisory(self.sid, stage_name, snap)
+            if self.on_event:
+                self.on_event("strategy_consult", {"stage": stage_name,
+                                                   "snapshot_keys": list(snap)[:8]})
+        except Exception as e:  # noqa: BLE001
+            log.warning("strategy consult failed: %s", e)
+
+    async def _strategy_consult_async(self, stage_name: str) -> None:
+        try:
+            snap = await asyncio.to_thread(self.adapter.get_state) or {}
+            if self.consult_ask_jev and self.client is not None and self._backend_available():
+                gate_ok = await asyncio.to_thread(self._consult_gate, snap, stage_name)
                 if not gate_ok:
                     if self.on_event:
                         self.on_event("strategy_skipped", {"stage": stage_name})
@@ -268,6 +305,76 @@ class DecisionEngine:
             log.info("decision loop stopped")
             return
 
+    # ---- backend / mode gating -------------------------------------------
+
+    def _backend_available(self) -> bool:
+        """Cheap cached probe (10s): is there a real decision backend?
+
+        Jev without an API key and laya without weights both mean "no
+        backend" — in that case we must NOT improvise baseline moves; the
+        main LLM drives the duel through tools instead.
+        """
+        now = time.monotonic()
+        if now - self._backend_checked_at < 10.0:
+            return self._backend_ok
+        self._backend_checked_at = now
+        client = self.client
+        ok = False
+        if client is not None:
+            if isinstance(client, JevClient):
+                ok = bool(client.has_key)
+            elif getattr(client, "_agent", None) is not None:
+                ok = True
+            elif callable(getattr(client, "ensure_loaded", None)):
+                try:
+                    ok = bool(client.ensure_loaded())
+                except Exception:  # noqa: BLE001
+                    ok = False
+            elif hasattr(client, "has_key"):
+                ok = bool(getattr(client, "has_key", False))
+            else:
+                # Custom/test backends without a key concept are usable.
+                ok = True
+        self._backend_ok = ok
+        return ok
+
+    def _decision_enabled(self) -> bool:
+        return bool(self.auto_decision) and self._backend_available()
+
+    def _needs_decision(self, snapshot: dict) -> bool:
+        """No legal options -> no backend call (opponent's turn / waiting)."""
+        if self.game == "ygo_engine":
+            g = (snapshot.get("game") or {}) if isinstance(snapshot, dict) else {}
+            if "legal_actions" not in g and "options" not in g:
+                return True  # legacy snapshot without an option list
+            return bool(options_map(g))
+        return True
+
+    def _maybe_request_input(self, snapshot: dict) -> None:
+        """Manual/LLM-driven mode: tell the main LLM its input is needed.
+
+        Fingerprint + time throttled so a waiting duel never spams chat.
+        """
+        if self.game != "ygo_engine":
+            return
+        g = (snapshot.get("game") or {}) if isinstance(snapshot, dict) else {}
+        opts = options_map(g)
+        if not opts or g.get("is_duel_active") is False:
+            return
+        fingerprint = (f"{g.get('turn')}|{g.get('phase')}|{len(opts)}|{g.get('my_lp')}|"
+                       f"{g.get('op_lp')}|{bool(g.get('response_window'))}")
+        now = time.monotonic()
+        if now - self._last_input_prompt_at < 45.0:
+            return
+        if fingerprint == self._last_input_fingerprint and now - self._last_input_prompt_at < 90.0:
+            return
+        self._last_input_fingerprint = fingerprint
+        self._last_input_prompt_at = now
+        if self.on_event:
+            reason = ("对手动作等待你响应（连锁或跳过）" if g.get("response_window")
+                      else "我方回合" if g.get("is_my_turn") else "轮到你决策")
+            self.on_event("need_input", {"options": len(opts), "reason": reason})
+
     async def _tick(self) -> None:
         self._loop_count += 1
         # Resolve the live backend each tick so laya autoinstall / Jev
@@ -277,49 +384,63 @@ class DecisionEngine:
                 self.client = self.backend_resolver() or self.client
             except Exception as e:  # noqa: BLE001
                 log.warning("backend resolve failed: %s", e)
-        # Strategic consult: on key-stage entry (handled in _on_stage_change)
-        # and periodically mid-game (long duels/battles).
-        self._maybe_periodic_strategy()
-        if self.adapter is None or not self.adapter.health():
-            # Bridge down — still try reconnect via health() tick.
-            if self.adapter and not self.adapter.start():
-                return
-            if self.adapter is None or not self.adapter.health():
-                return
-
-        snapshot = self.adapter.get_state()
+        if self.adapter is None:
+            return
+        try:
+            if not await asyncio.to_thread(self.adapter.health):
+                if not await asyncio.to_thread(self.adapter.start):
+                    return
+                if not await asyncio.to_thread(self.adapter.health):
+                    return
+            snapshot = await asyncio.to_thread(self.adapter.get_state)
+        except Exception as e:  # noqa: BLE001
+            log.warning("adapter tick failed: %s", e)
+            return
         if not snapshot:
             return
+        self.cached_snapshot = snapshot
 
         # Adopt stage reported by the adapter (joining/dueling/…).
         self._snapshot_stage(snapshot)
 
-        # Pre-input chain: if we have a planned action sequence and the state
-        # hasn't changed (no interruption), execute the next action without
-        # asking Jev again. This saves Jev calls on multi-step plays.
-        if self._try_chain(snapshot):
+        if not self._decision_enabled():
+            # Main-LLM/manual play: cache + stage only, never auto-fire.
+            self._maybe_request_input(snapshot)
+            return
+
+        # Pre-input chain: execute the next planned option only if it is
+        # still legal (semantic match, not a stale list index).
+        if await self._try_chain(snapshot):
             self._last_decision_at = time.monotonic()
             return
 
+        if not self._needs_decision(snapshot):
+            return
+
+        # Strategic consult: on key-stage entry (handled in _on_stage_change)
+        # and periodically mid-game (long duels/battles).
+        self._maybe_periodic_strategy()
         now = time.monotonic()
 
         # Fire the next request (async, non-blocking) — throttle by decision_hz.
         if now - self._last_decision_at >= max(self.decision_interval, 0.1):
             state = self._build_state(snapshot)
             questions = self._build_questions(snapshot)
-            self.client.ask_async(state, questions)
+            if questions:
+                self.client.ask_async(state, questions)
 
         # Drain the latest Jev answer from the background request.
         answer = self.client.ask_latest()
         if answer is not None:
-            self._apply_answer(answer, snapshot)
+            await self._apply_answer(answer, snapshot)
             self._last_decision_at = now
 
-        # Baseline / fallback execution when we have no fresh decision.
-        if now - self._last_decision_at > self.intent_ttl:
+        # Baseline fallback only makes sense for button-mashing games; a duel
+        # must never fire random primitives while waiting for a decision.
+        if self.game != "ygo_engine" and now - self._last_decision_at > self.intent_ttl:
             action = self.gate.decide(snapshot, nouls=None)
             if action != "wait":
-                self._execute(action, snapshot)
+                await self._execute(action, snapshot)
             return
 
     # ---- state / questions (game-aware) -----------------------------
@@ -351,10 +472,13 @@ class DecisionEngine:
     def _build_questions(self, snapshot: dict) -> dict:
         """Build the Jev questions. YGO gets duel-specific questions."""
         if self.game == "ygo_engine":
-            try:
-                from .jev.ygo_state import build_ygo_questions
-                return build_ygo_questions(snapshot, goal=self.goal)
-            except Exception as e:  # noqa: BLE001
+            g = (snapshot.get("game") or {}) if isinstance(snapshot, dict) else {}
+            if "legal_actions" in g or "options" in g:
+                try:
+                    from .jev.ygo_state import build_ygo_questions
+                    return build_ygo_questions(snapshot, goal=self.goal)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("ygo questions build failed, falling back: %s", e)
                 log.warning("ygo questions build failed, falling back: %s", e)
         goals = self._offer_goals(snapshot)
         if goals:
@@ -367,7 +491,7 @@ class DecisionEngine:
 
     # ---- answer application ----------------------------------------
 
-    def _apply_answer(self, answer: dict, snapshot: dict) -> None:
+    async def _apply_answer(self, answer: dict, snapshot: dict) -> None:
         answers = answer.get("answers", {})
         nouls = {}
         for key, a in answers.items():
@@ -376,24 +500,46 @@ class DecisionEngine:
 
         decision: dict[str, Any] = {"at": time.time(), "nouls": nouls}
 
-        # YGO: the main decision is next_action (choice over legal actions).
+        # YGO: the main decision is next_action (choice over legal option ids).
         if self.game == "ygo_engine" and "next_action" in answers and isinstance(answers["next_action"], dict):
             na = answers["next_action"]
-            action = str(na.get("choice", "")).strip()
+            ref = str(na.get("choice", "")).strip()
             conf = float(na.get("confidence", 0.0) or 0.0)
-            decision.update({"mode": "action", "action": action, "conf": conf,
+            action = resolve_option(snapshot, ref)
+            if action is None:
+                # Stale answer (the duel moved on): never blind-fire a move
+                # whose option no longer exists.
+                decision.update({"mode": "action", "action": ref, "skipped": "stale_option"})
+                self._record_decision(decision)
+                self._action_chain = []
+                log.info("ygo decision skipped, option %r no longer legal", ref)
+                return
+            name = str(action.get("action", ""))
+            decision.update({"mode": "action", "action": name, "option": ref,
+                             "card": action.get("card", ""), "conf": conf,
                              "probs": na.get("probabilities", {})})
             # High-risk YGO actions (summon/activate/attack) with low
             # confidence -> escalate to the main LLM for a strategic check.
-            if action in {"summon", "activate", "attack", "special_summon"} and conf < 0.6:
-                self._escalate(action, conf)
+            if name in {"summon", "activate", "attack", "special_summon"} and conf < 0.6:
+                self._escalate(name, conf)
             self._record_decision(decision)
-            if action and action != "wait":
-                self._execute(action, snapshot)
-                # Plan a short follow-up chain (pre-input): if the next legal
-                # actions are a natural continuation (e.g. summon → activate →
-                # battle → attack), queue them so we don't re-ask Jev.
-                self._plan_ygo_chain(snapshot, action)
+            if name and name != "wait":
+                ok = await self._execute_option(action, ref, snapshot)
+                if ok:
+                    try:
+                        fresh = await asyncio.to_thread(self.adapter.get_state) or snapshot
+                    except Exception:  # noqa: BLE001
+                        fresh = snapshot
+                    self.cached_snapshot = fresh
+                    # Plan a short follow-up chain on the post-move state.
+                    self._plan_ygo_chain(fresh, action)
+            return
+
+        if self.game == "ygo_engine" and (
+            "legal_actions" in (snapshot.get("game") or {}) or "options" in (snapshot.get("game") or {})
+        ):
+            # A duel snapshot without a next_action answer: wait for a real
+            # decision instead of mashing generic primitives.
             return
 
         if "next_goal" in answers and isinstance(answers["next_goal"], dict):
@@ -407,7 +553,7 @@ class DecisionEngine:
             if goal in {"attack", "summon", "activate", "flee"} and conf < 0.6:
                 self._escalate(goal, conf)
             if goal != "wait":
-                self._execute(goal, snapshot)
+                await self._execute(goal, snapshot)
         else:
             dialog = bool(snapshot.get("dialog"))
             menu = bool((nouls.get("menu_open") or 0.0) >= 0.5)
@@ -433,16 +579,19 @@ class DecisionEngine:
             elif action != "wait":
                 self._escalate(action, conf)
             self._record_decision(decision)
-            self._execute(action, snapshot)
+            await self._execute(action, snapshot)
 
     # ---- execution -------------------------------------------------
 
-    def _execute(self, action: str, snapshot: dict) -> None:
+    async def _execute(self, action: str, snapshot: dict) -> None:
         if action == "wait":
             self._last_action = "wait"
             return
         steps = self._action_steps(action, snapshot)
-        ok = self.adapter.act(steps)
+        if not steps:
+            log.info("action %r has no legal steps, skipped", action)
+            return
+        ok = await asyncio.to_thread(self.adapter.act, steps)
         outcome = "ok" if ok else "failed"
         self.memory.add_action(action, outcome)
         self._last_action = action
@@ -450,92 +599,86 @@ class DecisionEngine:
         if ok and self.on_event:
             self.on_event("action", {"action": action, "snapshot_keys": list(snapshot)[:8]})
 
+    async def _execute_option(self, action: dict, ref: str, snapshot: dict) -> bool:
+        """Submit exactly one legal YGO option and record the real verdict."""
+        payload = act_payload(action, ref)
+        ok = await asyncio.to_thread(self.adapter.act, [payload])
+        name = str(action.get("action", "?"))
+        card = str(action.get("card", "") or "")
+        self.memory.add_action(name, "ok" if ok else "failed", card[:60])
+        self._last_action = name + (f":{card}" if card else "")
+        self._last_action_at = time.monotonic()
+        if not ok:
+            self._action_chain = []
+        if self.on_event:
+            self.on_event("action", {"action": name, "card": card, "ok": ok, "quiet": True})
+        return ok
+
     # ---- pre-input action chain (plan a sequence, execute if not interrupted) ----
 
-    def _state_hash(self, snapshot: dict) -> str:
-        """A cheap fingerprint of the game state to detect interruptions."""
-        g = (snapshot.get("game") or {}) if isinstance(snapshot, dict) else {}
-        return f"{g.get('turn')}|{g.get('phase')}|{g.get('my_lp')}|{g.get('op_lp')}|{len(g.get('field_my', []))}|{len(g.get('field_op', []))}"
+    async def _try_chain(self, snapshot: dict) -> bool:
+        """Execute the next planned option if it is *still legal*.
 
-    def _is_interrupted(self, snapshot: dict) -> bool:
-        """True when the state changed in a way that invalidates the chain
-        (phase/turn/LP/field changed, or opponent responded)."""
-        h = self._state_hash(snapshot)
-        return h != self._chain_snapshot_hash
-
-    def _try_chain(self, snapshot: dict) -> bool:
-        """If we have a planned chain and the state hasn't changed, execute the
-        next action in the chain WITHOUT asking Jev. Returns True when the
-        chain was executed this tick (so we skip the Jev call)."""
+        Planned options are matched semantically (action/card/target/phase),
+        never by list position: our own previous move changes the state, so
+        the old "state hash changed = interrupted" rule both killed every
+        chain and could fire the wrong card. A mismatch simply ends the chain
+        and falls back to a fresh decision.
+        """
         if not self._action_chain:
             return False
-        if self._is_interrupted(snapshot):
-            # Interrupted — drop the chain and re-decide from the new state.
+        planned = self._action_chain[0]
+        action = match_action(snapshot, planned)
+        if action is None:
             self._action_chain = []
             return False
-        # Not interrupted — execute the next planned action.
-        action = self._action_chain.pop(0)
-        self._execute(action, snapshot)
-        # Refresh the snapshot hash after executing (state changed by us).
-        try:
-            new_snap = self.adapter.get_state()
-            self._chain_snapshot_hash = self._state_hash(new_snap)
-        except Exception:  # noqa: BLE001
-            pass
+        self._action_chain.pop(0)
+        await self._execute_option(action, "", snapshot)
         return True
 
-    def _plan_ygo_chain(self, snapshot: dict, last_action: str) -> None:
-        """Plan a short follow-up action chain for YGO (pre-input).
+    def _plan_ygo_chain(self, snapshot: dict, last_action: dict) -> None:
+        """Plan up to 3 natural follow-up options on the post-move state.
 
-        After a high-confidence action (e.g. summon), queue natural
-        continuations (activate its effect, switch to battle, attack) so we
-        don't re-ask Jev for each step. The chain is dropped if the state
-        changes unexpectedly (interrupted)."""
-        g = (snapshot.get("game") or {}) if isinstance(snapshot, dict) else {}
-        legal = g.get("legal_actions", [])
+        Only low-surprise continuations are queued (a summon effect, phase
+        switch into battle, one best attack). Anything that stops matching
+        the live legal list aborts the chain instead of guessing.
+        """
+        if not self.auto_decision:
+            return
+        legal = options_map(snapshot)
         if not legal:
+            self._action_chain = []
             return
-        chain: list[str] = []
-        # Common natural continuations after a summon.
-        if last_action in ("summon", "special_summon"):
-            for a in legal:
+        actions = list(legal.values())
+        chain: list[dict] = []
+        if last_action.get("action") in ("summon", "summon_def", "special_summon", "set"):
+            for a in actions:
                 if a.get("action") == "activate" and a.get("card"):
-                    chain.append("activate")  # activate the summoned card's effect
+                    chain.append(a)
                     break
-        # After building board, switch to battle and attack if safe.
-        for a in legal:
-            if a.get("action") == "switch" and a.get("phase") == "battle":
-                chain.append("switch")
-                break
-        for a in legal:
-            if a.get("action") in ("attack", "direct_attack"):
-                chain.append(a["action"])
-                break
-        if chain:
-            self._action_chain = chain
-            self._chain_snapshot_hash = self._state_hash(snapshot)
-
-    def _plan_chain(self, snapshot: dict) -> None:
-        """Generic chain planning (kept for other games; YGO uses
-        _plan_ygo_chain)."""
-        if not self._action_chain:
-            return
-        self._chain_snapshot_hash = self._state_hash(snapshot)
+        if last_action.get("action") != "attack":
+            for a in actions:
+                if a.get("action") == "switch" and a.get("phase") == "battle":
+                    chain.append(a)
+                    break
+        attackers = [a for a in actions if a.get("action") in ("attack", "direct_attack")]
+        if attackers and len(chain) < 3:
+            best = max(attackers, key=lambda a: a.get("atk") or 0)
+            chain.append(best)
+        self._action_chain = chain[:3]
 
     def _action_steps(self, action: str, snapshot: dict) -> list[dict]:
         """Map an engine action to adapter steps. YGO actions are duel
         actions (summon/activate/attack/…); other games use generic
         primitives (confirm/move_up/…)."""
         if self.game == "ygo_engine":
-            # YGO legal actions are passed through to the bridge.
-            # Action names come from the adapter's legal_actions list.
+            # Only a currently-legal option may be submitted; an unknown
+            # action name yields no steps (never a blind best-effort move).
             g = (snapshot.get("game") or {}) if isinstance(snapshot, dict) else {}
-            legal = g.get("legal_actions", [])
-            for a in legal:
+            for a in g.get("legal_actions", []):
                 if (a.get("action") or a.get("type")) == action:
                     return [a]
-            # Fallback: try a best-effort mapping for common actions.
-            return [{"action": action}]
+            return []
         frames = 8
         if action in ACTION_NAMES:
             frames = 8

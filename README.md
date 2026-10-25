@@ -102,8 +102,13 @@ plugin/
 - **搭车注入**：用户每轮发消息时，`@on.llm_request` 钩子自动把该会话运行中游戏的**一行状态摘要**挂进 `chat_env`（persist=False，用完即弃、不落记忆）。所以用户问"你这波为什么这么操作"时，主 LLM **自动带着局面和最近决策**回答，不需要单独触发。
 - **主动升级**：Jev 对高风险动作（YGO 的 attack/summon/activate 等）置信度低于阈值，或连续低置信（streak≥3）→ `Escalator` 发合成消息唤醒主 LLM 决策轮。LLM 用 `game_state`/`game_command`/`game_set_goal` 回写。带冷却（120s）防刷屏，冷却期间升级意图保留、过后一次触发。
 - **阶段状态机**：每游戏一组阶段（YGO: idle→joining→confirming_opponent→readying→dueling→ended；宝可梦: overworld→dialog→menu→battle）。阶段迁移是事件——普通迁移走播报，关键迁移（对局开始）走升级。适配器在快照里报 `stage` 即可被引擎采纳。
-- **按需工具注入**：WebUI 配置"启用的游戏"（enabled_games 多选）——勾选 YGO 才向 LLM 注入 `game_ygo_join/ready/set_deck/duel_info`，勾选宝可梦才注入 `game_pkm_*`。未启用的游戏工具不进工具表。
-- **YGO 专用工具**：`game_ygo_join(room, deck)` 加入房间 → `game_ygo_ready()` 确认准备 → `game_ygo_duel_info()` 查对局详情（LP/手牌/场况/合法动作）→ `game_ygo_set_deck(name)` 换卡组（.ydk 目录）。
+- **按需工具注入**：WebUI 配置"启用的游戏"（enabled_games 多选）——勾选 YGO 才注入 `game_ygo` / `game_ygo_duel`（**两个合并工具覆盖全链路，更省 token**），勾选宝可梦才注入 `game_pkm_*`。未启用的游戏工具不进工具表。旧的 `game_ygo_join/ready/set_deck/duel_info` 保留为兼容别名，默认不注入。
+- **YGO 全链路（主 LLM 直接打，无需 Jev）**：
+  - `game_ygo`：`op=decks` 看卡组 → `build_deck` 上传 .ydk 组卡（本地校验 40-60/同名≤3）→ `host` 建房或 `join` 进房（`server`/`password` 联机参数）→ `set_deck` 选卡 → `ready` 准备 → 房主 `start` 开始；另有 `rooms/leave/surrender/chat`。
+  - `game_ygo_duel`：`op=state` 实时紧凑局面（LP/手牌/双方场面/合法选项/公开日志）→ `op=act option=编号` 精确执行 → `op=chain options=编号1,编号2` 连打（每步按最新局面校验，失效即停并返回现场）→ `op=log` 公开日志。
+  - **选项协议**：只提交当前合法选项（带桥 id 或下标 + 语义字段 + ocgcore 响应码），同名多张卡不会互相覆盖，**选哪张就执行哪张**；被拒绝的操作如实返回失败，绝不假装成功。
+  - **对手回合响应**：`response_window` 出现时可连锁或跳过，同样走 `act`。
+  - 详见 [guides/YGO指南.md](guides/YGO指南.md)（真实引擎桥 REST 契约 + 联机打真人配置）。
 
 ## 支持的游戏
 
@@ -120,6 +125,7 @@ plugin/
 WebUI 侧边栏 → 「游戏 Agent」：全部设置可**热修改即时生效**（不重启插件）：
 - Jev：API key / 模型 / 决策频率 / 超时 / TTL / 置信度双阈值 / 温度
 - 桥：游戏 / 地址 / 端口（0=自动探测）/ 轮询间隔 / 自动重连
+- **游戏王 · 网络对战**：`network`（打真人，默认）/ `single`；独立 YGO 桥地址端口（默认 5274，**不是**通用桥 17878）；YGOPro 服务器 `host:port`（如 EDOPro LAN `127.0.0.1:7911`）；默认卡组；房间密码；桥超时；`ygo_auto` 自动决策开关（**默认关 = 主 LLM 手动打，不开 Jev 也能玩**；无后端时即使打开也回退手动）
 - 知识：通用玩法说明书 + 分游戏背板（JSON，加内容不写代码）
 - 播报：开关 / 会话 / 间隔
 
@@ -128,8 +134,30 @@ API key 也可设环境变量 `TYPESAFE_API_KEY`（console.typesafe.ai 获取）
 ## 测试
 
 ```bash
-python3 smoke_test.py   # 离线烟雾测试（无需 key、无需 KiraAI、无需游戏）
+python3 smoke_test.py                    # 引擎/门控/通知/链等 80 项（离线，无需 key）
+python3 tests/ygo_ops_test.py            # 选项寻址/组卡校验/状态格式 40 项
+python3 tests/ygo_network_test.py        # 无 Jev 网络全链路（真人第二客户端）62 项
+python3 tests/ygo_auto_test.py           # 自动模式：零拒绝/无空请求/无 stale 13 项
+python3 tests/ygo_pokemon_test.py        # YGO 状态构造等 29 项
+python3 tests/consistency_check.py       # 前后端配置一致性 188 项
+python3 tests/ygo_demo.py                # 可观看的双模式实战演示（自动 + 主 LLM 网络）
+KIRAAI_ROOT=/path/to/KiraAI python3 tests/kira_real_load_test.py   # 真实 KiraAI v3.1.0 加载 20 项
 ```
+
+## 更新日志
+
+### v1.1.0（YGO 网络对战全链路 + 无 Jev 主 LLM 可玩）
+
+- **YGO 全流程打通**：组卡（.ydk 上传+本地校验）/选卡/建房/进房/准备/开始/对局操作/连锁响应/投降/退房/房间聊天，`network` 联机打真人为默认模式。
+- **不开 Jev 也能玩**：默认主 LLM 用两个合并工具（`game_ygo` + `game_ygo_duel`）打完整场；`ygo_auto` 为可选自动模式，无后端自动回退手动，决斗不再使用通用按键基线。
+- **选项协议重写**：合法选项带 id，同名多卡不再互相覆盖；执行前按最新局面解析，**选哪张执行哪张**；失效/拒绝一律如实报错（旧版 HTTP 200 即成功、按动作名取第一个匹配，都是错的）。
+- **预输入链修正**：改语义匹配（action/card/target/phase），旧版"状态哈希变化即中断"会让链必死且可能打错卡。
+- **token 优化**：YGO 专用工具 4→2；自动决策每次只问 `next_action` 一个问题（旧版 5-7 个答案无人消费）；无合法选项不发请求；状态输出默认紧凑（15 选项/可关效果）；搭车注入改一行 YGO 摘要。
+- **无阻塞**：桥调用全部 `to_thread`；搭车注入只读缓存（旧版每次 LLM 请求都同步 HTTP）；状态读取不再先打一次 `/health`。
+- **提示词安全**：搭车注入不再修改共享 `chat_env`（旧版会跨轮污染累积），改为追加 `persist=False` 的独立 Prompt，配合框架动态块迁移保缓存。
+- **配置**：新增「游戏王 · 网络对战」段（8 项，热生效）；YGO 桥端口独立于通用桥；修复 laya 自动安装开关新旧键不一致导致关不掉的问题；`stop_keywords` 不再误吞未真正停止时的消息。
+- **测试**：新增联机端到端（含真人第二客户端、连锁响应、精确选卡）、自动模式零拒绝、选项单测、真实 KiraAI v3.1.0 加载验证；mock 桥升级为支持双客户端房间的参考实现（含每怪一次攻击等规则）。
+
 
 ## 参考实现（本方案吸收的设计）
 

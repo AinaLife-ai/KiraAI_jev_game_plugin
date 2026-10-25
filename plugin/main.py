@@ -8,7 +8,12 @@
   limit and per-sid send timeout.
 - Tools: game_play / game_state / game_command / game_set_goal /
          game_jev_ask / game_logs / game_diag / game_pause / game_resume /
-         game_stop
+         game_stop (+ merged game_control / game_inspect / game_direct /
+         game_chain)
+- YGO (network duels vs real players): two merged tools game_ygo +
+  game_ygo_duel cover decks/build_deck/host/join/ready/start and
+  state/act/chain/log. The main LLM can play a whole duel with NO Jev/laya
+  backend; automatic decisions are an explicit opt-in (ygo_auto).
 - Hooks/API/Page: WebUI sidebar config page (hot-reload settings).
 """
 from __future__ import annotations
@@ -109,6 +114,19 @@ class KiraGameAgentPlugin(BasePlugin):
             "poll_interval": float(b.get("poll_interval", 2.0) or 2.0),
             "auto_reconnect": bool(b.get("auto_reconnect", True)),
             "rom": b.get("rom", "") or "",
+        }
+        y = self._cfg.get("section_ygo", {}) or {}
+        self.ygo_cfg = {
+            # Network play against real people is the primary mode.
+            "ygo_mode": y.get("ygo_mode", "network") or "network",
+            "ygo_host": y.get("ygo_host", "127.0.0.1") or "127.0.0.1",
+            "ygo_port": int(y.get("ygo_port", 5274) or 5274),
+            "ygo_server": y.get("ygo_server", "") or "",
+            "ygo_password": y.get("ygo_password", "") or "",
+            "ygo_deck": y.get("ygo_deck", "") or "",
+            "ygo_timeout": float(y.get("ygo_timeout", 5.0) or 5.0),
+            # Off by default: the main LLM plays through tools, no Jev needed.
+            "ygo_auto": bool(y.get("ygo_auto", False)),
         }
         self.playbook_cfg = {
             "game_instructions": p.get("game_instructions", "") or "",
@@ -252,6 +270,8 @@ class KiraGameAgentPlugin(BasePlugin):
         for eng in self.engines.values():
             eng.apply_cfg(self.jev_cfg)
             eng.set_playbook(self._playbook_for(eng.game))
+            if eng.game == "ygo_engine":
+                eng.auto_decision = bool(self.ygo_cfg.get("ygo_auto", False))
 
     def _playbook_for(self, game: str) -> str:
         return str(self.playbook_cfg["per_game_playbook"].get(game, ""))
@@ -316,7 +336,10 @@ class KiraGameAgentPlugin(BasePlugin):
             return self.engines[eid]
         if self.client is None or self.gate is None:
             return None
-        adapter = create_adapter(game, self.bridge_cfg)
+        adapter_cfg = dict(self.bridge_cfg)
+        if game == "ygo_engine":
+            adapter_cfg.update(getattr(self, "ygo_cfg", {}) or {})
+        adapter = create_adapter(game, adapter_cfg)
         if adapter is None:
             return None
         eng = DecisionEngine(
@@ -339,6 +362,9 @@ class KiraGameAgentPlugin(BasePlugin):
             consult_threshold=self.jev_cfg.get("consult_threshold", 0.6),
             strategy_stages=self._strategy_stages_for(game),
             strategy_interval_rounds=int(self.jev_cfg.get("strategy_interval_rounds", 8) or 8),
+            # YGO defaults to main-LLM play (no Jev/laya needed); auto mode is
+            # an explicit opt-in in the YGO config section.
+            auto_decision=(bool(self.ygo_cfg.get("ygo_auto", False)) if game == "ygo_engine" else True),
         )
         eng.game = game
         eng.sid = sid
@@ -374,7 +400,17 @@ class KiraGameAgentPlugin(BasePlugin):
         self.notify.enqueue(eid, kind, text, bound)
 
     def _event_text(self, kind: str, payload: dict) -> str:
+        if kind == "need_input":
+            return (f"🎮 游戏王等待你的决策：{payload.get('reason', '轮到你')}，"
+                    f"当前 {payload.get('options', '?')} 个合法选项。"
+                    "用 game_ygo_duel op=state 看局面，op=act option=编号 执行，"
+                    "或 op=chain options=编号1,编号2 连打。")
         if kind == "action":
+            if payload.get("ok") is False:
+                return (f"⚠️ 游戏操作被引擎拒绝：{payload.get('action', '?')}。"
+                        "请用 game_ygo_duel op=state 查看最新合法选项后再操作。")
+            if payload.get("quiet"):
+                return ""  # duel actions stay in the tool transcript, not chat
             return f"🎮 游戏 Agent：执行了 {payload.get('action', '?')}"
         if kind == "danger":
             return f"⚠️ 游戏 Agent：危险等级上升（{payload.get('level', '?')}）"
@@ -393,7 +429,9 @@ class KiraGameAgentPlugin(BasePlugin):
 
     def _escalate_emit(self, sid: str, reason: str) -> None:
         """Jev hesitated -> synthesize a user-like message to wake the main LLM."""
-        text = f"（系统提示）当前对局需要你决策：{reason}。你可以用 game_state 看局面，game_command 直接操作，或 game_set_goal 定打法。"
+        text = (f"（系统提示）当前对局需要你决策：{reason}。"
+                "你可以用 game_ygo_duel op=state 看局面、op=act option=编号 直接操作，"
+                "或 game_set_goal 定打法（通用游戏用 game_inspect/game_direct）。")
         try:
             asyncio.create_task(self._send_notice(sid, text))
         except Exception as e:  # noqa: BLE001
@@ -423,6 +461,17 @@ class KiraGameAgentPlugin(BasePlugin):
             log.warning("advisory emit task failed: %s", e)
 
     def _compact_summary_from_snapshot(self, stage: str, snap: dict) -> str:
+        if isinstance(snap.get("game"), dict) and (
+            "legal_actions" in snap["game"] or "my_lp" in snap["game"]
+        ):
+            from .ygo_ops import PHASE_ZH, game_of, options_map
+            g = game_of(snap)
+            phase = PHASE_ZH.get(str(g.get("phase")), str(g.get("phase", "?")))
+            return (f"阶段={stage} LP我{g.get('my_lp', '?')}/敌{g.get('op_lp', '?')} "
+                    f"回合{g.get('turn', '?')} {phase} "
+                    f"{'我方行动' if g.get('is_my_turn') else '对手行动'} "
+                    f"手牌{len(g.get('hand', []))} 场上{len(g.get('field_my', []))}/{len(g.get('field_op', []))} "
+                    f"合法选项{len(options_map(g))}个")
         parts = [f"阶段={stage}"]
         player = snap.get("player")
         if isinstance(player, dict):
@@ -477,7 +526,7 @@ class KiraGameAgentPlugin(BasePlugin):
         eng = self._get_or_create_engine(sid, game)
         if eng is None:
             return f"无法创建引擎：{game}（检查适配器/配置）"
-        ok = eng.adapter.start()
+        ok = await asyncio.to_thread(eng.adapter.start)
         if not ok:
             await self._stop_engine(_engine_id(sid, game))
             return f"游戏桥连接失败（{game}）。请检查模拟器/引擎/mod 是否运行。"
@@ -485,6 +534,12 @@ class KiraGameAgentPlugin(BasePlugin):
         if goal:
             eng.set_goal(goal)
         await eng.start()
+        if game == "ygo_engine":
+            return ("YGO 引擎已就绪（默认主 LLM 手动打，无需 Jev）。完整流程："
+                    "game_ygo op=decks 看卡组（或 build_deck 组卡）→ host 建房 / join 进房 "
+                    "（server=服务器:端口 可打真人）→ ready → 房主 start；"
+                    "对局用 game_ygo_duel op=state 看局面、op=act option=编号 操作、op=chain 连打。"
+                    + (f" 当前目标：{goal}" if goal else ""))
         return f"已开始游玩 {game}" + (f"，目标：{goal}" if goal else "") + "。可用 game_state 查看实时情况。"
 
     @register.tool(
@@ -502,16 +557,28 @@ class KiraGameAgentPlugin(BasePlugin):
         eng = self._default_engine(event.sid, game)
         if eng is None or eng.adapter is None:
             return "本会话还没有运行中的游戏。先 game_play 开始一个。"
-        snap = eng.adapter.get_state()
+        if eng.game == "ygo_engine":
+            # Cache-first: never block a user turn on a bridge round trip.
+            snap = getattr(eng.adapter, "cached_snapshot", None) or {}
+            if not snap:
+                snap = await asyncio.to_thread(eng.adapter.get_state)
+            if not snap or not snap.get("game"):
+                return ("YGO 尚未进入对局。完整流程：game_ygo op=decks → host/join → ready → start；"
+                        "对局内用 game_ygo_duel op=state/act。")
+            from .ygo_ops import format_duel_state
+            return format_duel_state(snap, stage=eng.stage(), goal=eng.goal, with_effects=False)
+        snap = await asyncio.to_thread(eng.adapter.get_state)
         if not snap:
             return "暂时拿不到游戏状态（桥可能未连接）。"
         parts = [
             f"游戏: {eng.game}",
             f"运行: {'是' if eng.running else '否'}",
             f"目标: {eng.goal or '未设置'}",
-            f"玩家: {snap.get('player', {})}",
-            f"世界: {snap.get('world', {})}",
         ]
+        if snap.get("player"):
+            parts.append(f"玩家: {snap['player']}")
+        if snap.get("world"):
+            parts.append(f"世界: {snap['world']}")
         dialog = (snap.get("dialog") or "").strip()
         if dialog:
             parts.append(f"当前文本: {dialog[:120]}")
@@ -541,7 +608,11 @@ class KiraGameAgentPlugin(BasePlugin):
         eng = self._default_engine(event.sid, game)
         if eng is None or eng.adapter is None:
             return "本会话没有运行中的游戏。"
-        ok = eng.adapter.act([{"action": action, "frames": frames}])
+        if eng.game == "ygo_engine":
+            # Duel actions must go through option validation too (an option
+            # id, "summon:Card" or "switch:battle" all resolve live).
+            return await self._ygo_duel_op(event, "act", option=action, action=action)
+        ok = await asyncio.to_thread(eng.adapter.act, [{"action": action, "frames": frames}])
         return f"已执行 {action}" if ok else f"执行 {action} 失败"
 
     @register.tool(
@@ -581,7 +652,7 @@ class KiraGameAgentPlugin(BasePlugin):
         eng = self._default_engine(event.sid, game)
         if eng is None or eng.adapter is None or self.client is None:
             return "本会话没有运行中的游戏。"
-        snap = eng.adapter.get_state() or {}
+        snap = await asyncio.to_thread(eng.adapter.get_state) or {}
         q = {"type": question_type, "instructions": question}
         if question_type == "choice" and options:
             try:
@@ -591,7 +662,7 @@ class KiraGameAgentPlugin(BasePlugin):
         if question_type == "score":
             q["criteria"] = ["low", "medium", "high"]
         try:
-            resp = self.client.ask_sync(snap, {"custom": q})
+            resp = await asyncio.to_thread(self.client.ask_sync, snap, {"custom": q})
             answers = resp.get("answers", resp) if isinstance(resp, dict) else resp
             return json.dumps(answers, ensure_ascii=False)
         except Exception as e:  # noqa: BLE001
@@ -731,7 +802,9 @@ class KiraGameAgentPlugin(BasePlugin):
                 )
             except Exception:  # noqa: BLE001
                 pass
-        event.discard()
+            # Only swallow the message when we actually stopped something;
+            # otherwise the keyword may be ordinary conversation.
+            event.discard()
 
     # ---- hitchhiking + per-game tool injection ---------------------------
 
@@ -745,45 +818,71 @@ class KiraGameAgentPlugin(BasePlugin):
            user asks about the game."""
         sid = getattr(event, "sid", "")
         # 1. tools
-        for game in self.bridge_cfg["enabled_games"]:
-            for t in build_tools_for(game, self):
-                if req.tool_set.get(t.name) is None:
-                    req.tool_set.add(t)
+        tool_set = getattr(req, "tool_set", None)
+        if tool_set is not None:
+            for game in self.bridge_cfg["enabled_games"]:
+                for t in build_tools_for(game, self):
+                    if tool_set.get(t.name) is None:
+                        tool_set.add(t)
         # Tool granularity: merged mode keeps only the merged tools
         # (game_play/control/inspect/direct) + per-game specials; fine mode
         # keeps everything. This keeps the LLM tool table compact by default.
-        if self.bridge_cfg.get("tool_granularity", "merged") == "merged":
+        if tool_set is not None and self.bridge_cfg.get("tool_granularity", "merged") == "merged":
             fine_tools = {
                 "game_state", "game_logs", "game_diag",
                 "game_command", "game_set_goal", "game_jev_ask",
                 "game_pause", "game_resume", "game_stop",
             }
-            req.tool_set.remove(*fine_tools)
+            tool_set.remove(*fine_tools)
         # 2. hitchhike summary
         if not sid:
             return
         eng = self._default_engine(sid)
-        if eng is None or not eng.running or eng.adapter is None:
+        if eng is None or eng.adapter is None:
             return
-        try:
-            snap = eng.adapter.get_state()
-        except Exception:  # noqa: BLE001
-            snap = {}
+        # Cache only: a bridge HTTP call here would stall every user turn.
+        snap = getattr(eng.adapter, "cached_snapshot", None) or {}
         if not snap:
             return
         summary = self._compact_summary(eng, snap)
         if not summary:
             return
-        for p in req.system_prompt:
-            if p.name == "chat_env":
-                p.content += f"\n[游戏 Agent] {summary}"
-                break
-        else:
-            req.system_prompt.append(
-                Prompt(summary, name="chat_env", source="kira_game_agent", persist=False)
-            )
+        # Append a fresh request-scoped Prompt instead of mutating the shared
+        # chat_env block (mutating it leaked state across turns and grew the
+        # prompt every request). Named chat_env so the framework relocates it
+        # next to the latest user message, keeping the system prefix cacheable.
+        req.system_prompt.append(
+            Prompt(f"[游戏 Agent] {summary}", name="chat_env", source="kira_game_agent", persist=False)
+        )
+
+    def _ygo_summary_line(self, eng, snap: dict) -> str:
+        """One compact line of duel context for the LLM turn (cache-friendly)."""
+        from .ygo_ops import PHASE_ZH, game_of, options_map
+        g = game_of(snap)
+        stage = eng.stage()
+        if not g:
+            room = snap.get("room") or {}
+            players = ",".join(str(p) for p in (room.get("players") or []))
+            return (f"游戏=游戏王 阶段={stage} 房间={room.get('name', '?')} 玩家[{players}] "
+                    "（流程：game_ygo ready→房主 start；对局操作用 game_ygo_duel）")
+        parts = [f"游戏=游戏王 阶段={stage}"]
+        parts.append(f"LP我{g.get('my_lp', '?')}/敌{g.get('op_lp', '?')}")
+        phase = PHASE_ZH.get(str(g.get('phase')), str(g.get('phase', '?')))
+        parts.append(f"回合{g.get('turn', '?')} {phase} {'我方行动' if g.get('is_my_turn') else '对手行动'}")
+        parts.append(f"手牌{len(g.get('hand', []))} 场上{len(g.get('field_my', []))}/{len(g.get('field_op', []))}")
+        opts = options_map(g)
+        if opts:
+            parts.append(f"合法选项{len(opts)}个")
+        if g.get("response_window"):
+            parts.append("⚠对手动作等待你响应（连锁或跳过）")
+        if g.get("is_duel_active") is False:
+            parts.append(f"对局已结束 胜者={g.get('winner') or '?'}")
+        parts.append("详情 game_ygo_duel op=state，操作 op=act option=编号")
+        return " ".join(parts)
 
     def _compact_summary(self, eng, snap: dict) -> str:
+        if eng.game == "ygo_engine":
+            return self._ygo_summary_line(eng, snap)
         parts = []
         st = eng.stage()
         parts.append(f"游戏={eng.game} 阶段={st}")
@@ -828,87 +927,30 @@ class KiraGameAgentPlugin(BasePlugin):
             return eng
         return self._get_or_create_engine(sid, "ygo_engine")
 
-    def _ygo_join(self, event, room: str, deck: str = "") -> str:
-        sid = event.sid
-        eng = self._ygo_engine(sid)
-        if eng is None:
-            return "无法创建 YGO 引擎（ygo_engine 适配器未就绪，检查是否已启用）"
-        if eng.adapter is None:
-            return "YGO 适配器未启动"
-        # Ensure engine is running so it detects duel start.
-        if not eng.running:
-            asyncio.create_task(eng.start())
-        eng.set_stage("joining")
-        eng.set_playbook(self._playbook_for("ygo_engine"))
-        if deck:
-            eng.set_goal(f"用卡组 {deck} 对战")
-        try:
-            if hasattr(eng.adapter, "join"):
-                res = eng.adapter.join(room, deck=deck)
-            else:
-                res = eng.adapter.command("/join", {"room": room, "deck": deck})
-            eng.set_stage("confirming_opponent")
-            eng.set_goal("等待对手确认，然后准备")
-            opponent = ""
-            if isinstance(res, dict):
-                opponent = res.get("opponent", "")
-            txt = f"已加入房间 {room}"
-            if opponent:
-                txt += f"，对手：{opponent}"
-            return txt
-        except Exception as e:  # noqa: BLE001
-            return f"加入房间失败: {e}"
+    async def _ygo_op(self, event, op: str, **kwargs) -> str:
+        """Deck/room lifecycle for YGO (see ygo_agent.lifecycle)."""
+        from . import ygo_agent
+        return await ygo_agent.lifecycle(self, event, op, **kwargs)
 
-    def _ygo_ready(self, event) -> str:
-        sid = event.sid
-        eng = self._default_engine(sid, "ygo_engine")
-        if eng is None or eng.adapter is None:
-            return "YGO 引擎未运行。先 game_ygo_join。"
-        try:
-            if hasattr(eng.adapter, "ready"):
-                res = eng.adapter.ready()
-            else:
-                res = eng.adapter.command("/ready", {})
-            eng.set_stage("readying")
-            return "已准备！等待对手开始。"
-        except Exception as e:  # noqa: BLE001
-            return f"准备失败: {e}"
+    async def _ygo_duel_op(self, event, op: str = "state", **kwargs) -> str:
+        """In-duel state/actions for YGO (see ygo_agent.duel)."""
+        from . import ygo_agent
+        return await ygo_agent.duel(self, event, op, **kwargs)
 
-    def _ygo_set_deck(self, event, deck: str) -> str:
-        sid = event.sid
-        eng = self._default_engine(sid, "ygo_engine")
-        if eng is None or eng.adapter is None:
-            return "YGO 引擎未运行。"
-        try:
-            if hasattr(eng.adapter, "set_deck"):
-                res = eng.adapter.set_deck(deck)
-            else:
-                res = eng.adapter.command("/set_deck", {"deck": deck})
-            return f"卡组已设为 {deck}"
-        except Exception as e:  # noqa: BLE001
-            return f"设置卡组失败: {e}"
+    async def _ygo_join(self, event, room: str, deck: str = "") -> str:
+        return await self._ygo_op(event, "join", room=room, deck=deck)
 
-    def _ygo_duel_info(self, event) -> str:
-        sid = event.sid
-        eng = self._default_engine(sid, "ygo_engine")
-        if eng is None or eng.adapter is None:
-            return "YGO 引擎未运行。"
-        snap = eng.adapter.get_state() or {}
-        game = snap.get("game", {})
-        hand = game.get("hand", [])
-        opp = game.get("opponent_hand_count")
-        parts = [
-            f"阶段: {eng.stage()}",
-            f"LP: 我 {game.get('my_lp', '?')} / 对手 {game.get('op_lp', '?')}",
-            f"回合: {game.get('turn', '?')}（{'我的' if game.get('is_my_turn') else '对手的'}）",
-            f"手牌({len(hand)}): " + ", ".join(str(c) for c in hand[:8]) if hand else "手牌: 空",
-        ]
-        if opp is not None:
-            parts.append(f"对手手牌: {opp} 张")
-        legal = game.get("legal_actions", [])
-        if legal:
-            parts.append(f"合法动作({len(legal)}): " + ", ".join(str(a) for a in legal[:10]))
-        return "\n".join(parts)
+    async def _ygo_host(self, event, room: str = "", deck: str = "") -> str:
+        return await self._ygo_op(event, "host", room=room, deck=deck)
+
+    async def _ygo_ready(self, event) -> str:
+        return await self._ygo_op(event, "ready")
+
+    async def _ygo_set_deck(self, event, deck: str) -> str:
+        return await self._ygo_op(event, "set_deck", deck=deck)
+
+    async def _ygo_duel_info(self, event) -> str:
+        return await self._ygo_duel_op(event, "state")
 
     def _pkm_use_item(self, event, item: str) -> str:
         sid = event.sid
@@ -984,6 +1026,10 @@ class KiraGameAgentPlugin(BasePlugin):
         eng = self._default_engine(event.sid, game)
         if eng is None or eng.adapter is None:
             return "本会话没有运行中的游戏。"
+        if eng.game == "ygo_engine":
+            # Every option is re-validated against the live state before it
+            # fires; our own moves changing the board is NOT an interruption.
+            return await self._ygo_duel_op(event, "chain", options=actions)
         # Parse the action chain: "summon:X,activate,switch:battle,attack"
         chain = []
         for part in actions.split(","):
@@ -1003,7 +1049,7 @@ class KiraGameAgentPlugin(BasePlugin):
         for step in chain:
             # Check if interrupted (state changed from what we expect)
             try:
-                snap = eng.adapter.get_state() or {}
+                snap = await asyncio.to_thread(eng.adapter.get_state) or {}
             except Exception:  # noqa: BLE001
                 snap = {}
             if last_state is not None and self._chain_interrupted(last_state, snap):
@@ -1015,11 +1061,16 @@ class KiraGameAgentPlugin(BasePlugin):
                         f"剩余未执行：{', '.join(s.get('action') for s in chain[len(executed):])}\n"
                         f"请根据现场继续判断。")
             # Execute this step
-            ok = eng.adapter.act([step])
+            ok = await asyncio.to_thread(eng.adapter.act, [step])
             if not ok:
                 return f"第 {len(executed)+1} 步（{step.get('action')}）执行失败。"
             executed.append(step.get("action"))
-            last_state = snap
+            # Re-baseline AFTER our own move: our own state change must not be
+            # mistaken for an opponent interruption on the next step.
+            try:
+                last_state = await asyncio.to_thread(eng.adapter.get_state) or snap
+            except Exception:  # noqa: BLE001
+                last_state = snap
         return f"预输入链全部执行完成（{len(executed)} 步：{', '.join(executed)}）。"
 
     def _chain_interrupted(self, old_state: dict, new_state: dict) -> bool:

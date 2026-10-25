@@ -59,10 +59,15 @@ def create_adapter(game: str, cfg: dict) -> Optional[Any]:
             log.error("adapter import failed: %s", e)
             return None
         return YgoEngineAdapter(
-            host=cfg.get("host", "127.0.0.1"),
-            port=int(cfg.get("port", 5274) or 5274),
-            game_mode=cfg.get("ygo_mode", "single"),
-            server_url=cfg.get("ygo_server", ""),
+            host=cfg.get("ygo_host") or cfg.get("host", "127.0.0.1"),
+            # Dedicated YGO bridge port; the generic bridge port (17878) is a
+            # different service and must never be reused for duels.
+            port=int(cfg.get("ygo_port", 5274) or 5274),
+            game_mode=cfg.get("ygo_mode", "network") or "network",
+            server_url=cfg.get("ygo_server", "") or "",
+            deck=cfg.get("ygo_deck", "") or "",
+            password=cfg.get("ygo_password", "") or "",
+            timeout=float(cfg.get("ygo_timeout", 5.0) or 5.0),
         )
 
     if game == "pokemon_pyboy":

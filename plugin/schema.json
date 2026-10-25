@@ -204,6 +204,63 @@
       }
     }
   },
+  "section_ygo": {
+    "type": "section",
+    "name": "游戏王 · 网络对战",
+    "collapsed": false,
+    "fields": {
+      "ygo_mode": {
+        "type": "enum",
+        "name": "对战模式",
+        "options": ["network", "single"],
+        "default": "network",
+        "hint": "network=联机房间，可与真实玩家对战（主要用途）；single=单机对内置 AI"
+      },
+      "ygo_host": {
+        "type": "string",
+        "name": "YGO 桥地址",
+        "default": "127.0.0.1",
+        "hint": "运行 ygopro-core 桥服务的地址（不是通用桥端口）"
+      },
+      "ygo_port": {
+        "type": "integer",
+        "name": "YGO 桥端口",
+        "default": 5274,
+        "minimum": 1,
+        "hint": "桥 HTTP 端口，默认 5274"
+      },
+      "ygo_server": {
+        "type": "string",
+        "name": "YGOPro 服务器 host:port",
+        "default": "",
+        "hint": "联机打真人时填，如 127.0.0.1:7911（EDOPro LAN）或你的 srvpro 地址；留空 = 由桥自行决定"
+      },
+      "ygo_deck": {
+        "type": "string",
+        "name": "默认卡组 .ydk",
+        "default": "",
+        "hint": "对局默认卡组；也可用 game_ygo op=decks/build_deck/set_deck 组卡选卡"
+      },
+      "ygo_password": {
+        "type": "string",
+        "name": "房间密码",
+        "default": "",
+        "hint": "加入有密码的房间时使用，留空 = 无密码"
+      },
+      "ygo_timeout": {
+        "type": "float",
+        "name": "桥请求超时 (秒)",
+        "default": 5.0,
+        "hint": "联机对局建议 3-8 秒，避免等待过久"
+      },
+      "ygo_auto": {
+        "type": "switch",
+        "name": "自动决策（需 Jev/laya）",
+        "default": false,
+        "hint": "默认关：主 LLM 用 game_ygo / game_ygo_duel 全流程打牌，不开 Jev 也能玩。开启后由 Jev/laya 自动操作（无后端时仍回退主 LLM 手动）"
+      }
+    }
+  },
   "section_playbook": {
     "type": "section",
     "name": "玩法知识 (Playbook)",

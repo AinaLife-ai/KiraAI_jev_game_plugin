@@ -161,6 +161,32 @@
     <button class="ghost" style="width:100%;margin-top:8px" onclick="rebind()">立即重连桥</button>
   </div>
 
+  <!-- YGO network duel -->
+  <div class="panel">
+    <h2>游戏王 · 网络对战（打真人）</h2>
+    <label>对战模式</label>
+    <select id="ygo_mode">
+      <option value="network">network（默认，联机房间，可打真实玩家）</option>
+      <option value="single">single（单机，对内置 AI）</option>
+    </select>
+    <div class="row">
+      <div style="flex:1"><label>YGO 桥地址</label><input type="text" id="ygo_host" value="127.0.0.1"></div>
+      <div style="flex:1"><label>YGO 桥端口</label><input type="number" id="ygo_port" min="1" max="65535"></div>
+    </div>
+    <label>YGOPro 服务器 host:port（联机打真人时填）</label>
+    <input type="text" id="ygo_server" placeholder="127.0.0.1:7911">
+    <label>默认卡组 .ydk（对局前也可用 game_ygo 组卡/选卡）</label>
+    <input type="text" id="ygo_deck" placeholder="dragon.ydk">
+    <label>房间密码（有密码的房间）</label>
+    <input type="text" id="ygo_password" placeholder="留空 = 无密码">
+    <div class="row">
+      <div style="flex:1"><label>桥超时 (s)</label><input type="number" id="ygo_timeout" step="0.5" min="1"></div>
+      <div style="flex:1"><label class="row" style="align-items:center;margin-top:24px"><input type="checkbox" id="ygo_auto" style="width:auto"> 自动决策（需 Jev/laya）</label></div>
+    </div>
+    <small>默认不自动决策：主 LLM 用 game_ygo / game_ygo_duel 完成 组卡→建房/进房→准备→开始→对局操作，不开 Jev 也能玩。勾选后由 Jev/laya 自动操作。</small>
+    <button class="save" onclick="saveYgo()">保存 YGO 设置（热生效）</button>
+  </div>
+
   <!-- playbook + strategy + notify -->
   <div class="panel">
     <h2>玩法知识 + 关键决策征询</h2>
@@ -249,7 +275,15 @@ async function loadStatus() {
 async function loadConfig() {
   try {
     const c = await j("GET", "/config");
-    const jev = c.section_jev || {}, br = c.section_bridge || {}, pb = c.section_playbook || {}, n = c.section_notify || {}, la = c.section_laya || {}, st = c.section_strategy || {};
+    const jev = c.section_jev || {}, br = c.section_bridge || {}, pb = c.section_playbook || {}, n = c.section_notify || {}, la = c.section_laya || {}, st = c.section_strategy || {}, y = c.section_ygo || {};
+    el("ygo_mode").value = y.ygo_mode || "network";
+    el("ygo_host").value = y.ygo_host || "127.0.0.1";
+    el("ygo_port").value = y.ygo_port ?? 5274;
+    el("ygo_server").value = y.ygo_server || "";
+    el("ygo_deck").value = y.ygo_deck || "";
+    el("ygo_password").value = y.ygo_password || "";
+    el("ygo_timeout").value = y.ygo_timeout ?? 5.0;
+    el("ygo_auto").checked = y.ygo_auto === true;
     el("backend").value = jev.backend || "laya";
     el("backend").addEventListener("change", toggleLaya);
     el("kira_provider_id").value = jev.kira_provider_id || "";
@@ -262,7 +296,7 @@ async function loadConfig() {
     el("laya_device").value = la.laya_device || la.device || "";
     el("laya_hf_mirror").value = la.laya_hf_mirror || la.hf_mirror || "";
     el("laya_local_model_path").value = la.laya_local_model_path || la.local_model_path || "";
-    el("laya_autoinstall").checked = (la.laya_autoinstall ?? la.autoinstall) !== false;
+    el("laya_autoinstall").checked = (la.laya_autoinstall ?? la.autoinstall) === true;
     el("decision_hz").value = jev.decision_hz ?? 1.0;
     el("request_timeout").value = jev.request_timeout ?? 5.0;
     el("intent_ttl").value = jev.intent_ttl ?? 1.5;
@@ -351,12 +385,31 @@ function saveJev() {
     },
     section_laya: {
       ...c.section_laya,
+      laya_autoinstall: el("laya_autoinstall").checked,
       autoinstall: el("laya_autoinstall").checked,
+      laya_model: el("laya_model").value,
       model: el("laya_model").value,
+      laya_subfolder: el("laya_subfolder").value,
       subfolder: el("laya_subfolder").value,
+      laya_device: el("laya_device").value,
       device: el("laya_device").value,
       laya_hf_mirror: el("laya_hf_mirror").value,
       laya_local_model_path: el("laya_local_model_path").value,
+    },
+  }));
+}
+function saveYgo() {
+  saveSection(c => ({
+    section_ygo: {
+      ...c.section_ygo,
+      ygo_mode: el("ygo_mode").value,
+      ygo_host: el("ygo_host").value,
+      ygo_port: parseInt(el("ygo_port").value, 10) || 5274,
+      ygo_server: el("ygo_server").value,
+      ygo_deck: el("ygo_deck").value,
+      ygo_password: el("ygo_password").value,
+      ygo_timeout: parseFloat(el("ygo_timeout").value) || 5.0,
+      ygo_auto: el("ygo_auto").checked,
     },
   }));
 }

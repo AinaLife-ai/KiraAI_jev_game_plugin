@@ -1,9 +1,9 @@
 {
   "plugin_id": "KiraAI_jev_game_plugin",
   "display_name": "Kira Jev Game",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "znq19",
-  "description": "让 KiraAI 通过 Jev / laya System 1 决策引擎游玩任意游戏：宝可梦(PyBoy/mGBA)、游戏王(YGOPro 引擎，支持网络对战)、泰拉瑞亚(TerraBlind) 等。零 VLM、快、省 token、预输入链、主 LLM 关键节点介入。",
+  "description": "让 KiraAI 游玩任意游戏：游戏王(YGOPro 引擎，支持网络对战打真人，主 LLM 无需 Jev 即可组卡/建房/进房/准备/开始/对局全链路操作)、宝可梦(PyBoy/mGBA)、泰拉瑞亚(TerraBlind) 等。可选 Jev/laya 自动决策。零 VLM、快、省 token、预输入链、主 LLM 关键节点介入。",
   "core_version": ">=2.33.1",
   "repo": "https://github.com/znq19/KiraAI_jev_game_plugin",
   "tags": ["game", "jev", "laya", "automation"],
