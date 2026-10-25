@@ -77,6 +77,7 @@ class KiraGameAgentPlugin(BasePlugin):
         self.escalator: Optional[Escalator] = None
         self.autoinstall: Optional[LayaAutoInstaller] = None
         self.ygo_installer = YgoBridgeInstaller(self)
+        self._game_tool_cache: dict[str, list] = {}
         self._events: list[dict] = []
 
     # ---- config ------------------------------------------------------
@@ -278,6 +279,12 @@ class KiraGameAgentPlugin(BasePlugin):
     def _playbook_for(self, game: str) -> str:
         return str(self.playbook_cfg["per_game_playbook"].get(game, ""))
 
+    def _tools_for(self, game: str) -> list:
+        """Cached per-game tool instances (identical schemas, no rebuild)."""
+        if game not in self._game_tool_cache:
+            self._game_tool_cache[game] = build_tools_for(game, self)
+        return self._game_tool_cache[game]
+
     # ---- lifecycle ----------------------------------------------------
 
     async def initialize(self) -> None:
@@ -402,6 +409,8 @@ class KiraGameAgentPlugin(BasePlugin):
         self.notify.enqueue(eid, kind, text, bound)
 
     def _event_text(self, kind: str, payload: dict) -> str:
+        if kind == "room_update":
+            return str(payload.get("text", ""))
         if kind == "need_input":
             return (f"🎮 游戏王等待你的决策：{payload.get('reason', '轮到你')}，"
                     f"当前 {payload.get('options', '?')} 个合法选项。"
@@ -531,6 +540,10 @@ class KiraGameAgentPlugin(BasePlugin):
         ok = await asyncio.to_thread(eng.adapter.start)
         if not ok:
             await self._stop_engine(_engine_id(sid, game))
+            if game == "ygo_engine":
+                return ("YGO 桥未连接。你可以用 game_ygo op=install_bridge 让我自动下载安装并启动"
+                        "真实引擎桥（ProjectIgnis/windbot + .NET 8，首次约几分钟），"
+                        "或手动启动桥后再试。无需安装 EDOPro。")
             return f"游戏桥连接失败（{game}）。请检查模拟器/引擎/mod 是否运行。"
         eng.set_playbook(self._playbook_for(game))
         if goal:
@@ -823,7 +836,7 @@ class KiraGameAgentPlugin(BasePlugin):
         tool_set = getattr(req, "tool_set", None)
         if tool_set is not None:
             for game in self.bridge_cfg["enabled_games"]:
-                for t in build_tools_for(game, self):
+                for t in self._tools_for(game):
                     if tool_set.get(t.name) is None:
                         tool_set.add(t)
         # Tool granularity: merged mode keeps only the merged tools
@@ -849,6 +862,10 @@ class KiraGameAgentPlugin(BasePlugin):
         summary = self._compact_summary(eng, snap)
         if not summary:
             return
+        # NOTE: this block is persist=False, i.e. it never lands in the chat
+        # history, so it MUST be re-supplied on each request (a one-liner).
+        # Cache-friendliness comes from the framework relocating it next to
+        # the latest user message, not from skipping it (that would lose info).
         # Append a fresh request-scoped Prompt instead of mutating the shared
         # chat_env block (mutating it leaked state across turns and grew the
         # prompt every request). Named chat_env so the framework relocates it
@@ -1209,7 +1226,7 @@ class KiraGameAgentPlugin(BasePlugin):
 
     @register.api(method="POST", path="/ygo_bridge/install", auth=True, summary="一键安装/更新 YGO 桥")
     async def api_ygo_bridge_install(self, body: dict = None):
-        ok, message = self.ygo_installer.install()
+        ok, message = self.ygo_installer.install(auto_start=True)
         return {"ok": ok, "message": message}
 
     @register.api(method="POST", path="/ygo_bridge/start", auth=True, summary="启动 YGO 桥")

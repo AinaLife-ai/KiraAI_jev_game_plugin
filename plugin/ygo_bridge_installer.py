@@ -31,6 +31,9 @@ class YgoBridgeInstaller:
         self.logs: deque[str] = deque(maxlen=120)
         self._install_thread: Optional[threading.Thread] = None
         self._bridge_proc: Optional[subprocess.Popen] = None
+        self._auto_start = False
+        self._sid = ""
+        self._loop = None
         self._lock = threading.Lock()
 
     # ---- helpers -----------------------------------------------------------
@@ -78,7 +81,7 @@ class YgoBridgeInstaller:
 
     # ---- install -----------------------------------------------------------
 
-    def install(self) -> tuple[bool, str]:
+    def install(self, auto_start: bool = False, sid: str = "") -> tuple[bool, str]:
         with self._lock:
             if self._install_thread and self._install_thread.is_alive():
                 return False, "正在安装中，请稍候"
@@ -87,6 +90,12 @@ class YgoBridgeInstaller:
             self.state = "installing"
             self.error = ""
             self.logs.clear()
+            self._auto_start = auto_start
+            self._sid = sid
+            try:
+                self._loop = asyncio.get_running_loop()
+            except RuntimeError:
+                self._loop = None
             self._install_thread = threading.Thread(target=self._run_install, daemon=True)
             self._install_thread.start()
         return True, "开始安装（克隆 windbot → 打补丁 → .NET 8 编译 → 卡库），日志见下方"
@@ -110,18 +119,36 @@ class YgoBridgeInstaller:
                 raise RuntimeError("安装脚本结束但未找到启动脚本")
             self.state = "ready"
             self._log("安装完成，可以启动桥")
+            if self._auto_start:
+                self._log("正在自动启动桥…")
+                started = self._launch_bridge()
+                healthy = self._wait_healthy(45.0) if started else False
+                if healthy:
+                    self._notify("✅ YGO 真实引擎桥已安装并启动（127.0.0.1:5274）。"
+                                 "现在可以：game_ygo op=decks 选卡/组卡 → host 建房或 join 进房 → ready → start。")
+                else:
+                    self._notify("⚠️ YGO 桥已安装，但启动健康检查未通过。请查看配置页日志或 bridge.log。")
+            else:
+                self._notify("✅ YGO 桥安装完成，可在配置页点「▶ 启动」。")
         except Exception as e:  # noqa: BLE001
             self.state = "error"
             self.error = str(e)
             self._log(f"安装失败：{e}")
+            self._notify(f"⚠️ YGO 桥自动安装失败：{e}（详见配置页日志）")
+
+    def _notify(self, text: str) -> None:
+        """Tell the requesting session the install finished (never blocks)."""
+        if not getattr(self, "_sid", "") or not getattr(self, "_loop", None):
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(self.plugin._send_notice(self._sid, text), self._loop)
+        except Exception as e:  # noqa: BLE001
+            log.warning("install notify failed: %s", e)
 
     # ---- bridge process ----------------------------------------------------
 
-    async def start_bridge(self) -> dict:
-        if self._bridge_proc and self._bridge_proc.poll() is None:
-            return {"ok": True, "message": "桥已在运行", "healthy": self._health()}
-        if not self._run_script_path().exists():
-            return {"ok": False, "message": "尚未安装桥，请先一键安装"}
+    def _launch_bridge(self) -> bool:
+        """Spawn the bridge process (sync; shared by install and start)."""
         try:
             logfile = self.dir / "bridge.log"
             self.dir.mkdir(parents=True, exist_ok=True)
@@ -132,8 +159,18 @@ class YgoBridgeInstaller:
                     cwd=str(self.dir),
                 )
             self._log("桥进程已启动，等待健康检查…")
+            return True
         except Exception as e:  # noqa: BLE001
-            return {"ok": False, "message": f"启动失败：{e}"}
+            self._log(f"启动失败：{e}")
+            return False
+
+    async def start_bridge(self) -> dict:
+        if self._bridge_proc and self._bridge_proc.poll() is None:
+            return {"ok": True, "message": "桥已在运行", "healthy": self._health()}
+        if not self._run_script_path().exists():
+            return {"ok": False, "message": "尚未安装桥，请先一键安装"}
+        if not self._launch_bridge():
+            return {"ok": False, "message": "启动失败，请查看安装日志"}
         healthy = await asyncio.to_thread(self._wait_healthy, 45.0)
         return {
             "ok": healthy,

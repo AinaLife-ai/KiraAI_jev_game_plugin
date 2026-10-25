@@ -62,17 +62,19 @@ def build_tools_for(game: str, plugin) -> list[BaseTool]:
 class GameYgo(BaseTool):
     name = "game_ygo"
     description = (
-        "游戏王（可与真实玩家网络对战，无需 Jev）：组卡/选卡/建房/进房/准备/开始/退房。"
-        "完整流程 op=decks 看卡组（或 build_deck 组卡）→ host 建房或 join 进房 → ready 准备 → "
-        "房主 start 开始。对局内操作用 game_ygo_duel。"
+        "游戏王（可与真实玩家网络对战，无需 Jev/EDOPro）：组卡/选卡/建房/进房/准备/开始/退房。"
+        "若桥未连接，先 op=install_bridge 自动下载安装并启动真实引擎桥（完成后会通知你），"
+        "op=bridge_status 查进度。完整流程 op=decks 看卡组（或 build_deck 组卡）→ "
+        "host 建房（server=公共服:7911）或 join 进房 → ready 准备 → 房主 start 开始。"
+        "对局内操作用 game_ygo_duel。"
     )
     parameters = {
         "type": "object",
         "properties": {
             "op": {
                 "type": "string",
-                "enum": ["decks", "build_deck", "rooms", "host", "join", "set_deck",
-                         "ready", "start", "leave", "surrender", "chat"],
+                "enum": ["install_bridge", "bridge_status", "decks", "build_deck", "rooms",
+                         "host", "join", "set_deck", "ready", "start", "leave", "surrender", "chat"],
                 "description": "decks 卡组列表 / build_deck 组卡上传 / rooms 房间列表 / host 建房 / "
                                "join 进房 / set_deck 选卡组 / ready 准备 / start 房主开始 / "
                                "leave 退房 / surrender 投降 / chat 房间聊天",

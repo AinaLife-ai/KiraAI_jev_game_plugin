@@ -59,7 +59,9 @@ async def _ready_bridge(plugin, sid: str, start_loop: bool = True):
             err = getattr(adapter, "last_error", "") or "桥不可达"
             return eng, adapter, (
                 f"YGO 桥连接失败（{getattr(adapter, 'host', '?')}:{getattr(adapter, 'port', '?')}）：{err}\n"
-                "请确认桥服务已启动（单机/联机引擎见 guides/YGO指南.md）。"
+                "可直接用 game_ygo op=install_bridge 让我自动下载安装并启动真实引擎桥"
+                "（ProjectIgnis/windbot + .NET 8，首次约几分钟，无需 EDOPro），"
+                "或你手动启动桥后再试。"
             )
     if start_loop and not eng.running:
         try:
@@ -105,10 +107,48 @@ def _deck_zones(main: str = "", extra: str = "", side: str = "", ydk: str = "") 
     return {"main": split(main), "extra": split(extra), "side": split(side)}
 
 
+async def _bridge_admin(plugin, op: str, sid: str = "") -> str:
+    """Install / start / inspect the real engine bridge from the LLM itself."""
+    installer = plugin.ygo_installer
+    status = installer.status()
+    if op == "bridge_status":
+        lines = [f"桥状态: {status['state']} | 已安装: {status['installed']} | "
+                 f"运行: {status['bridge_running']} | 健康: {status['bridge_ok']}",
+                 f"目录: {status['dir']}"]
+        if status.get("error"):
+            lines.append("错误: " + status["error"])
+        lines.extend(status.get("log", [])[-6:])
+        if status["bridge_ok"]:
+            lines.append("桥已就绪：下一步 op=decks → host/join → ready → start。")
+        return "\n".join(lines)
+
+    # install_bridge
+    if status["bridge_ok"]:
+        return ("真实引擎桥已在运行且健康。下一步：op=decks 看卡组（66 套真实卡组）"
+                "或 build_deck 自组 → host 建房 / join 进房 → ready → start。")
+    if status["installed"]:
+        result = await installer.start_bridge()
+        if result.get("healthy"):
+            return "桥已启动并通过健康检查。下一步：op=decks → host/join → ready → start。"
+        return ("桥已安装但启动健康检查未过：" + str(result.get("message", ""))
+                + "\n可用 op=bridge_status 看日志，或检查 .NET/端口占用。")
+    if status["state"] == "installing":
+        return ("正在自动安装桥（下载 .NET/引擎/卡库）…完成后会自动启动并通知你。"
+                "可用 op=bridge_status 查看进度。\n" + "\n".join(status.get("log", [])[-4:]))
+    ok, message = installer.install(auto_start=True, sid=sid)
+    if not ok:
+        return f"无法开始安装：{message}"
+    return ("已开始自动安装真实引擎桥（ProjectIgnis/windbot + .NET 8，含卡库，"
+            "约 1-5 分钟取决于网络）。**完成后会自动启动桥并通知你**，"
+            "届时我会继续 组卡→建房/进房→准备→开始。可用 op=bridge_status 查看进度。")
+
+
 async def lifecycle(plugin, event, op: str, **kw) -> str:
     """Room/deck lifecycle operations (game_ygo tool)."""
     sid = event.sid
     op = (op or "").strip().lower()
+    if op in ("install_bridge", "bridge_status"):
+        return await _bridge_admin(plugin, op, sid)
     eng, adapter, err = await _ready_bridge(plugin, sid, start_loop=op not in ("decks", "build_deck", "rooms"))
     if adapter is None:
         return err
@@ -181,8 +221,6 @@ async def lifecycle(plugin, event, op: str, **kw) -> str:
         opponent = res.get("opponent") or getattr(adapter, "opponent", "")
         head = ("已创建房间" if op == "host" else "已加入房间") + f" {room_name}"
         details = []
-        if server or getattr(adapter, "server_url", ""):
-            details.append(f"服务器={server or adapter.server_url}")
         if players:
             details.append("玩家=" + ",".join(str(p) for p in players))
         if opponent:
@@ -192,6 +230,14 @@ async def lifecycle(plugin, event, op: str, **kw) -> str:
         snap = await asyncio.to_thread(adapter.get_state)
         if eng is not None:
             _stage_after(eng, snap)
+        actual_server = ""
+        if isinstance(snap.get("room"), dict):
+            actual_server = str(snap["room"].get("server") or "")
+        if actual_server or server or getattr(adapter, "server_url", ""):
+            details.append(f"服务器={actual_server or server or adapter.server_url}")
+        if not (server or getattr(adapter, "server_url", "")):
+            details.append("⚠未指定公共服地址，使用桥默认（通常本机 127.0.0.1:7911）；"
+                           "打公共服请在配置页填 ygo_server 或下次带 server=地址:端口")
         body = _brief_state(eng, snap) if snap.get("game") else ""
         return "\n".join(x for x in [head + (" | " + " ".join(details) if details else ""), body, NEXT[op]] if x)
 
@@ -248,7 +294,7 @@ async def lifecycle(plugin, event, op: str, **kw) -> str:
             return _fail("发送聊天失败", res, adapter)
         return f"已向房间发送：{message}"
 
-    return f"未知操作 {op}。支持 decks/build_deck/rooms/host/join/set_deck/ready/start/leave/surrender/chat。"
+    return f"未知操作 {op}。支持 install_bridge/bridge_status/decks/build_deck/rooms/host/join/set_deck/ready/start/leave/surrender/chat。"
 
 
 async def duel(plugin, event, op: str, **kw) -> str:

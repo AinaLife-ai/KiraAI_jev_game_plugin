@@ -84,6 +84,7 @@ class DecisionEngine:
         self._backend_checked_at = 0.0
         self._last_input_fingerprint = ""
         self._last_input_prompt_at = 0.0
+        self._room_fingerprint = None
         self._strategy_round_counter = 0
         self._strategy_consulted_stages: set[str] = set()
         self.gate = gate
@@ -300,7 +301,7 @@ class DecisionEngine:
                     raise
                 except Exception as e:  # noqa: BLE001
                     log.warning("engine tick error: %s", e)
-                await asyncio.sleep(self.decision_interval)
+                await asyncio.sleep(self._poll_delay())
         except asyncio.CancelledError:
             log.info("decision loop stopped")
             return
@@ -375,6 +376,66 @@ class DecisionEngine:
                       else "我方回合" if g.get("is_my_turn") else "轮到你决策")
             self.on_event("need_input", {"options": len(opts), "reason": reason})
 
+    def _poll_delay(self) -> float:
+        """Adaptive polling: duels need freshness, idle rooms need almost no
+        traffic. This is what keeps bridge calls (and CPU) to a minimum."""
+        base = self.decision_interval
+        g = (self.cached_snapshot or {}).get("game") or {}
+        if g.get("is_duel_active"):
+            if g.get("decision") or g.get("response_window"):
+                # Faster while an answer is due, but never slower than base.
+                return min(base, max(0.3, base * 0.5))
+            return base
+        # Room lifecycle (waiting for players/ready/start) must stay snappy:
+        # opponent joins and duel starts are exactly the events we report.
+        stage = str((self.cached_snapshot or {}).get("stage") or "")
+        if stage in ("joining", "confirming_opponent", "readying", "dueling", "ended"):
+            return base
+        # Only a genuinely idle engine (no room at all) polls slowly.
+        return max(base, 3.0)
+
+    def _check_room_events(self, snapshot: dict) -> None:
+        """Emit a notice when the *room* changes (opponent joins, both ready,
+        duel starts/ends) so the main LLM can drive the flow proactively."""
+        if self.game != "ygo_engine":
+            return
+        room = (snapshot or {}).get("room") or {}
+        g = (snapshot or {}).get("game") or {}
+        players = tuple(str(p) for p in (room.get("players") or []))
+        ready = room.get("ready") if isinstance(room.get("ready"), dict) else {}
+        ready_key = tuple(sorted((str(k), bool(v)) for k, v in ready.items()))
+        active = bool(g.get("is_duel_active"))
+        winner = str(g.get("winner") or "")
+        fingerprint = (players, ready_key, active, winner)
+        if self._room_fingerprint is None:
+            self._room_fingerprint = fingerprint
+            return
+        if fingerprint == self._room_fingerprint:
+            return
+        old = self._room_fingerprint
+        self._room_fingerprint = fingerprint
+        if active and not old[2]:
+            text = "🎮 对局开始！用 game_ygo_duel op=state 看局面，op=act option=编号 操作。"
+        elif not active and old[2]:
+            text = (f"🎮 对局结束{('，胜者：' + winner) if winner else ''}。"
+                    "可 game_ygo op=leave 退房，或 op=host/join 再来一局。")
+        elif len(players) > len(old[0]):
+            newcomers = [p for p in players if p not in old[0]] or list(players[-1:])
+            text = (f"🎮 对手已进房：{', '.join(newcomers)}。"
+                    "请 game_ygo op=ready 准备；双方就绪后房主 op=start 开局。")
+        elif ready_key != old[1]:
+            if ready and len(ready) >= 2 and all(ready.values()):
+                text = "🎮 双方都准备好了，房主用 game_ygo op=start 开局。"
+            elif ready:
+                text = "🎮 房间准备状态：" + ", ".join(
+                    f"{k}={'已准备' if v else '未准备'}" for k, v in ready.items())
+            else:
+                return
+        else:
+            return
+        if self.on_event:
+            self.on_event("room_update", {"text": text})
+
     async def _tick(self) -> None:
         self._loop_count += 1
         # Resolve the live backend each tick so laya autoinstall / Jev
@@ -402,6 +463,7 @@ class DecisionEngine:
 
         # Adopt stage reported by the adapter (joining/dueling/…).
         self._snapshot_stage(snapshot)
+        self._check_room_events(snapshot)
 
         if not self._decision_enabled():
             # Main-LLM/manual play: cache + stage only, never auto-fire.
