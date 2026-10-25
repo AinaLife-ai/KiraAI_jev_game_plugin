@@ -306,6 +306,20 @@ async def duel(plugin, event, op: str, **kw) -> str:
         executed: list[str] = []
         snap = await asyncio.to_thread(adapter.get_state)
         for ref in raw_options:
+            game = (snap or {}).get("game") or {}
+            if game.get("multi_select"):
+                # Real-engine multi-card decisions (tributes/materials/sums):
+                # submit the index list verbatim; the bridge validates count.
+                if op == "chain":
+                    return "多选决策（祭品/素材/凑和）请用 op=act 一次提交，不用 chain。"
+                res = await asyncio.to_thread(adapter.submit, {"option": str(ref)})
+                if not res.get("ok"):
+                    return _fail(f"多选提交 {ref} 失败", res, adapter) + "\n" + _brief_state(eng, snap, full=False)
+                executed.append(f"多选 {ref}")
+                new_state = res.get("state")
+                snap = new_state if isinstance(new_state, dict) and new_state.get("game") else await asyncio.to_thread(adapter.get_state)
+                _stage_after(eng, snap)
+                continue
             action = resolve_option(snap, ref)
             if action is None:
                 head = (f"已执行 {len(executed)} 步：{'；'.join(executed)}\n" if executed else "")

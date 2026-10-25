@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <StartupObject>KiraYgoBridge.KiraServer</StartupObject>
+    <AssemblyName>KiraYgoBridge</AssemblyName>
+    <RootNamespace>KiraYgoBridge</RootNamespace>
+    <NoWarn>CS0618;CS0414;CS0649;CS0169;CS0219;CS1591;CS0162;CS0168;CS0675</NoWarn>
+    <!-- Path to a ProjectIgnis/windbot checkout (already patched by apply_patches.py) -->
+    <WindBotSrc Condition="'$(WindBotSrc)' == ''">$(MSBuildProjectDirectory)/../windbot-src</WindBotSrc>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="$(WindBotSrc)/YGOSharp.Network/**/*.cs" />
+    <Compile Include="$(WindBotSrc)/Game/**/*.cs" />
+    <Compile Include="$(WindBotSrc)/ExecutorBase/**/*.cs" />
+    <Compile Include="$(WindBotSrc)/Config.cs" />
+    <Compile Include="$(WindBotSrc)/Logger.cs" />
+    <Compile Include="$(WindBotSrc)/WindBotInfo.cs" />
+    <Compile Include="$(WindBotSrc)/Program.cs" />
+    <Compile Include="src/**/*.cs" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.10" />
+  </ItemGroup>
+</Project>

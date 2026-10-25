@@ -42,6 +42,7 @@ from .notify import NotifyRouter
 from .session_mgr import SessionBindings
 from .tools import build_tools_for
 from .autoinstall import LayaAutoInstaller
+from .ygo_bridge_installer import YgoBridgeInstaller
 
 log = logging.getLogger("kira_game_agent")
 
@@ -75,6 +76,7 @@ class KiraGameAgentPlugin(BasePlugin):
         self.notify: Optional[NotifyRouter] = None
         self.escalator: Optional[Escalator] = None
         self.autoinstall: Optional[LayaAutoInstaller] = None
+        self.ygo_installer = YgoBridgeInstaller(self)
         self._events: list[dict] = []
 
     # ---- config ------------------------------------------------------
@@ -1200,6 +1202,23 @@ class KiraGameAgentPlugin(BasePlugin):
             "notify": self.notify.stats() if self.notify else {},
             "events": self._events[-20:],
         }
+
+    @register.api(method="GET", path="/ygo_bridge/status", auth=True, summary="YGO 桥安装/运行状态")
+    async def api_ygo_bridge_status(self):
+        return self.ygo_installer.status()
+
+    @register.api(method="POST", path="/ygo_bridge/install", auth=True, summary="一键安装/更新 YGO 桥")
+    async def api_ygo_bridge_install(self, body: dict = None):
+        ok, message = self.ygo_installer.install()
+        return {"ok": ok, "message": message}
+
+    @register.api(method="POST", path="/ygo_bridge/start", auth=True, summary="启动 YGO 桥")
+    async def api_ygo_bridge_start(self, body: dict = None):
+        return await self.ygo_installer.start_bridge()
+
+    @register.api(method="POST", path="/ygo_bridge/stop", auth=True, summary="停止 YGO 桥")
+    async def api_ygo_bridge_stop(self, body: dict = None):
+        return self.ygo_installer.stop_bridge()
 
     @register.api(method="GET", path="/config", auth=True, summary="当前配置")
     async def api_get_config(self):

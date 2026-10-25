@@ -388,6 +388,19 @@ def format_duel_state(
             counts.append(f"{title}{v}")
     if counts:
         lines.append("资源: " + " ".join(counts))
+    decision = g.get("decision")
+    if isinstance(decision, dict) and decision.get("kind"):
+        hint = decision.get("hint") or ""
+        lines.append(f"待你决策[{decision['kind']}]: {hint}")
+    multi = g.get("multi_select")
+    if isinstance(multi, dict):
+        text = f"多选 {multi.get('min', 0)}-{multi.get('max', 1)} 张"
+        if multi.get("sum"):
+            text += f"（数值合计需={multi['sum']}）"
+        text += "：op=act option=编号1,编号2 一次提交"
+        if multi.get("cancelable"):
+            text += "，或选 cancel 取消"
+        lines.append(text)
     opts = options_map(g)
     if opts:
         lines.append(f"合法选项({len(opts)})——用 op=act option=编号 执行:")

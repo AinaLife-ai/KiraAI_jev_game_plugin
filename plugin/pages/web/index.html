@@ -185,6 +185,15 @@
     </div>
     <small>默认不自动决策：主 LLM 用 game_ygo / game_ygo_duel 完成 组卡→建房/进房→准备→开始→对局操作，不开 Jev 也能玩。勾选后由 Jev/laya 自动操作。</small>
     <button class="save" onclick="saveYgo()">保存 YGO 设置（热生效）</button>
+    <hr>
+    <label>真实引擎桥（ProjectIgnis/windbot + .NET 8，可连公共服打真人）</label>
+    <div class="row">
+      <button class="save" style="flex:1" onclick="ygoBridgeInstall()">⬇ 一键安装/更新桥</button>
+      <button class="ghost" style="flex:1" onclick="ygoBridgeAction('start')">▶ 启动</button>
+      <button class="ghost" style="flex:1" onclick="ygoBridgeAction('stop')">■ 停止</button>
+    </div>
+    <small>只在点击后才会下载/编译（需 .NET 8 SDK 与 git，脚本会尝试自动安装）。安装完点"启动"，健康检查通过即可用 game_ygo 全流程打牌。</small>
+    <pre id="ygo_bridge_status" style="max-height:150px;overflow:auto;font-size:11px;white-space:pre-wrap"></pre>
   </div>
 
   <!-- playbook + strategy + notify -->
@@ -463,8 +472,27 @@ async function rebind() {
   loadStatus();
 }
 
-loadConfig(); loadStatus();
-setInterval(loadStatus, 5000);
+async function ygoBridgeInstall() {
+  el("ygo_bridge_status").textContent = "开始安装（数分钟，取决于网络）…";
+  const r = await j("POST", "/ygo_bridge/install", {});
+  el("ygo_bridge_status").textContent = r.message || JSON.stringify(r);
+  refreshYgoBridge();
+}
+async function ygoBridgeAction(op) {
+  el("ygo_bridge_status").textContent = op === "start" ? "启动中（健康检查）…" : "停止中…";
+  const r = await j("POST", "/ygo_bridge/" + op, {});
+  el("ygo_bridge_status").textContent = r.message || JSON.stringify(r);
+  refreshYgoBridge();
+}
+async function refreshYgoBridge() {
+  try {
+    const s = await j("GET", "/ygo_bridge/status");
+    const head = `状态:${s.state} | 已安装:${s.installed} | 桥运行:${s.bridge_running} | 健康:${s.bridge_ok}\n目录:${s.dir}\n`;
+    el("ygo_bridge_status").textContent = head + (s.error ? "错误:" + s.error + "\n" : "") + (s.log || []).join("\n");
+  } catch (e) { }
+}
+loadConfig(); loadStatus(); refreshYgoBridge();
+setInterval(() => { loadStatus(); refreshYgoBridge(); }, 5000);
 </script>
 </body>
 </html>

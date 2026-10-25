@@ -17,58 +17,57 @@ KiraAI 主 LLM
 KiraAI_jev_game_plugin（本插件）
    │  HTTP REST（下方契约）
    ▼
-YGO 桥服务（ygopro-core 的适配层，默认 127.0.0.1:5274）
+KiraYgoBridge（ProjectIgnis/windbot 真实引擎，默认 127.0.0.1:5274）
    │  ocgcore / YGOPro 网络协议
    ▼
-真实对局：EDOPro、YGOPro、Neos、srvpro 房间里的真实玩家
+真实对局：公共服务器、EDOPro、YGOPro、Neos 房间里的真实玩家
 ```
 
-**必须理解的一点**：插件本身**不包含 ygopro-core 游戏引擎**（它负责规则、卡效、房间协议）。和真实玩家对战需要一个运行中的**桥服务**，由桥把真实引擎的状态和合法选项暴露给插件。
+**现在仓库里已经带了真实引擎桥 `KiraYgoBridge`**（`plugin/ygo_bridge/`，基于 ProjectIgnis/windbot，含最新卡与大师规则，AGPL-3.0），并且可以**一键自动安装**。你不需要自己写桥。
 
-仓库里提供两种桥：
+三种桥的定位：
 
 | 桥 | 用途 | 能否打真人 |
 |---|---|---|
-| `tests/mock_ygo_bridge.py` | 测试/演示用参考实现：完整实现下方契约，支持双客户端房间、准备/开始、轮流回合、攻击宣言的连锁响应、投降/聊天 | ❌ 规则是简化的（10 张示范卡、简化卡效），**不能当真实引擎用** |
-| 真实引擎桥（按下文契约对接） | 生产使用 | ✅ |
-
-mock 桥同时是**对接文档的可运行样例**：真实桥实现同样的端点与字段即可接入插件，不需要改插件代码。
+| **`KiraYgoBridge`（推荐）** | 真实引擎（windbot + ocgcore 规则），连公共服务器/EDOPro 房间 | ✅ 真实规则、真实玩家 |
+| `tests/mock_ygo_bridge.py` | 测试/演示用参考实现：双客户端房间、准备/开始、轮流回合、攻击连锁、投降/聊天 | ❌ 规则简化（示范卡池），**只用于测试** |
+| 自研桥（按下文契约） | 想接自己的引擎（如 ygoenv）时 | ✅ 实现同一契约即可，插件不用改 |
 
 ---
 
-## 2. 真实对接路径（按推荐顺序）
+## 2. 一键安装真实桥（推荐路径）
 
-### 路径 A：EDOPro + 房间桥（打真人最直接）
+### Windows（你的环境）
 
-真实玩家用 EDOPro（Project Ignis）客户端，通过 **LAN 模式**进入同一个房间：
+在插件目录执行（或直接在 KiraAI 配置页点按钮）：
 
-1. 安装 EDOPro（含卡数据库、脚本、`libocgcore`）。
-2. 桥进程作为 YGOPro 协议客户端**建房或进房**（参考 IceYGO/windbot 的房间连接方式，或 mostwanted7/ygo-agent 的 WindBot fork——它就是这样让 AI 进入 EDOPro 房间的）。
-3. 插件配置页 →「游戏王 · 网络对战」：
-   - 对战模式 `network`
-   - YGO 桥地址/端口 = 你的桥（默认 `127.0.0.1:5274`）
-   - YGOPro 服务器 = 房间所在服务器，例如本机 LAN `127.0.0.1:7911`，或你的 srvpro 地址
-4. 真人玩家在 EDOPro 里输入同样的服务器与房间名进房，双方准备，房主开始。
+```powershell
+# 方式一：KiraAI「游戏 Agent → 游戏王 · 网络对战」面板
+#   点「⬇ 一键安装/更新桥」，完成后点「▶ 启动」（有健康检查和日志）
 
-参考项目（真实存在，可研究其引擎对接方式）：
-
-- `mostwanted7/ygo-agent` —— LLM 驱动的 EDOPro 对手/教练。它的做法与本插件一致：**引擎生成合法选项，模型只回答选项编号，校验后才交给引擎**。本插件的选项协议与它对齐。
-- `IceYGO/windbot` —— C# 的 YGOPro 对战机，可加入真实房间。
-- `edo9300/edopro`、`Fluorohydride/ygopro-core` —— 客户端与规则引擎本体。
-- `mycard/srvpro` —— YGOPro 服务器（建房/房间管理）。
-
-### 路径 B：ygoenv（无头引擎，适合自动化/AI 对战）
-
-`sbl1996/ygo-agent` 的 `ygoenv` 基于 envpool + ygopro-core，提供 gym 接口，适合本地无头对局与训练；其生态也支持在 Neos 客户端进行人机对战。桥把环境的观测转换为公共状态、把动作索引发给引擎即可，插件侧的 `option` 字段正好承载动作索引。
-
-### 路径 C：只想先跑起来看效果
-
-```bash
-python3 tests/mock_ygo_bridge.py      # 127.0.0.1:5274
-python3 tests/ygo_demo.py             # 自动模式 + 主 LLM 网络模式各打一场
+# 方式二：命令行手动执行同一个脚本
+powershell -ExecutionPolicy Bypass -File plugin\scripts\install_ygo_bridge.ps1
+powershell -File "$env:USERPROFILE\KiraYgoBridge\run_bridge.ps1"
 ```
 
-配置页保持默认（桥 `127.0.0.1:5274`）即可体验完整流程；打真人请换真实引擎桥。
+脚本会自动完成：检测/安装 .NET 8 SDK 与 git → 克隆 ProjectIgnis/windbot → 应用桥补丁 → 编译 → 复制卡组/对话框 → 下载 `cards.cdb` → 生成启动脚本。默认安装到 `用户目录\KiraYgoBridge`，**只在点击/执行后才下载**，可重复运行升级。
+
+### Linux / macOS
+
+```sh
+sh plugin/scripts/install_ygo_bridge.sh
+~/KiraYgoBridge/run_bridge.sh
+```
+
+### 启动后
+
+- 桥默认监听 `127.0.0.1:5274`，插件配置页「YGO 桥地址/端口」保持默认即可。
+- 离线自测：`selftest`（Windows `selftest.ps1` / Linux `selftest.sh`），应输出 27 项全过。
+- 想打公共服：继续看第 4、7 节；想先本机体验简化规则，可改用 `tests/mock_ygo_bridge.py`（仅测试用）。
+
+### 自研桥（可选）
+
+如果你已有自己的引擎（ygoenv、EDOPro Lua 等），只要实现第 3 节的 REST 契约，插件无需修改即可使用。参考项目：`mostwanted7/ygo-agent`（LLM×EDOPro，选项编号决策，与本插件同思路）、`sbl1996/ygo-agent`（ygoenv gym）、`IceYGO/windbot`、`mycard/srvpro`（服务器）。
 
 ---
 
@@ -218,7 +217,9 @@ game_ygo op=build_deck name=demo.ydk
 
 | 现象 | 原因与处理 |
 |---|---|
-| `YGO 桥连接失败` | 桥没启动/端口错。检查 `ygo_host`/`ygo_port`（默认 5274，**不是**通用桥 17878）。 |
+| `YGO 桥连接失败` | 桥没启动/端口错。配置页点「⬇ 一键安装/更新桥」再「▶ 启动」，看面板日志；或手动跑 `run_bridge` 脚本并查看 `bridge.log`。端口默认 5274，**不是**通用桥 17878。 |
+| 公共服连不上/被断开 | 检查服务器地址与端口（通常 7911）、房名/密码、协议版本是否匹配（本桥使用上游当前版本）；公司/校园网可能封禁非 HTTP 端口。 |
+| 安装桥失败 | 看面板安装日志：缺 .NET 8 SDK / git / Python 时按提示安装；NuGet 或 GitHub 访问受限时先配置代理再重跑脚本（幂等）。 |
 | `进房失败：房间不存在` | 网络模式下房间必须已存在；先让对方建房，或用 `op=host` 自己建。 |
 | `开始对局失败` | 双方都要进房并 `ready`，且只有房主能 `start`。 |
 | `选项当前不合法` | 局面已变化（对手响应/阶段推进）。按返回的最新选项重新选择，属于正常保护。 |
@@ -238,6 +239,11 @@ python3 tests/ygo_pokemon_test.py           # 状态构造等 29 项
 python3 tests/consistency_check.py          # 前后端配置一致性 188 项
 python3 tests/ygo_demo.py                   # 可观看的双模式实战演示
 KIRAAI_ROOT=/path/to/KiraAI python3 tests/kira_real_load_test.py   # 真实框架加载 20 项
+python3 tests/ygo_installer_test.py           # 插件侧桥安装/启动/停止 11 项
+
+# 真实引擎桥（.NET 8）
+sh plugin/scripts/install_ygo_bridge.sh       # 从零一键安装（已实测通过）
+~/KiraYgoBridge/selftest.sh                   # 引擎语义自测 27 项（选项↔引擎响应一致）
 ```
 
 真实引擎桥接入后，建议先用 `game_ygo_duel op=state` 核对它返回的手牌/场面/选项是否与客户端一致，再开始自动操作。

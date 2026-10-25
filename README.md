@@ -116,7 +116,7 @@ plugin/
 |---|---|---|
 | 宝可梦 红/蓝/黄 | `pokemon_pyboy`（进程内 PyBoy，读 RAM，零截图） | jev-plays-pokemon 已验证该路线 |
 | 宝可梦 | `mgba_http`（mGBA + HTTP 桥） | 外部进程备选 |
-| 游戏王 | `ygo_engine`（YGOPro 引擎，结构化状态+合法动作） | 支持网络对战（引擎协议） |
+| 游戏王 | `ygo_engine` + **KiraYgoBridge**（ProjectIgnis/windbot 真实引擎，.NET 8） | **公共服务器打真人**，最新卡与大师规则；也可自研桥对接 |
 | 泰拉瑞亚 | `terrablind_http`（TerraBlind mod） | 已验证打全 boss |
 | 任意 | `generic_http`（GET /state + POST /act） | 社区游戏直接接 |
 
@@ -131,6 +131,17 @@ WebUI 侧边栏 → 「游戏 Agent」：全部设置可**热修改即时生效*
 
 API key 也可设环境变量 `TYPESAFE_API_KEY`（console.typesafe.ai 获取）。
 
+## 真实引擎桥（KiraYgoBridge）与一键安装
+
+插件自带 **真实 YGO 引擎桥**（`plugin/ygo_bridge/`，基于 ProjectIgnis/windbot，AGPL-3.0，保留许可与修改声明）：
+
+- **Windows**：`powershell -ExecutionPolicy Bypass -File plugin\scripts\install_ygo_bridge.ps1`，或配置页「游戏王 · 网络对战」点 **⬇ 一键安装/更新桥**，再 **▶ 启动**（有健康检查与日志）。
+- **Linux/macOS**：`sh plugin/scripts/install_ygo_bridge.sh`，然后 `~/KiraYgoBridge/run_bridge.sh`。
+- 安装内容：克隆上游 → 打补丁（`apply_patches.py`，锚点校验）→ .NET 8 编译 → 卡组/对话框/`cards.cdb` → 启动/自测脚本。**只在点击/执行后下载**，幂等可升级。
+- 桥默认 `127.0.0.1:5274`；公共服在 `game_ygo host/join` 时填 `server=服务器:7911`，真人用 EDOPro/MyCard 进同房名即可。房名密码按 `房名#密码` 拼接（可用完整房名覆盖）。
+- 一进程一座位；多房间请多实例不同端口。内置 AI 在桥未接管/超时/异常时回退，对局不卡死。
+- 详见 [plugin/ygo_bridge/README.md](plugin/ygo_bridge/README.md)（决策点清单、边界、许可）与 [guides/YGO指南.md](guides/YGO指南.md)。
+
 ## 测试
 
 ```bash
@@ -142,9 +153,21 @@ python3 tests/ygo_pokemon_test.py        # YGO 状态构造等 29 项
 python3 tests/consistency_check.py       # 前后端配置一致性 188 项
 python3 tests/ygo_demo.py                # 可观看的双模式实战演示（自动 + 主 LLM 网络）
 KIRAAI_ROOT=/path/to/KiraAI python3 tests/kira_real_load_test.py   # 真实 KiraAI v3.1.0 加载 20 项
+python3 tests/ygo_installer_test.py           # 插件侧桥安装/启动/停止 11 项
+sh plugin/scripts/install_ygo_bridge.sh       # 真实桥一键安装（已实测）+ 自测 27 项
 ```
 
 ## 更新日志
+
+### v1.2.0（真实引擎桥 + 一键自动安装，公共服打真人）
+
+- **新增 KiraYgoBridge**：基于 ProjectIgnis/windbot（2026-08 主仓库）的 .NET 8 真实引擎桥，含最新卡与大师规则；约 3.7 万行核心代码 + 桥，**编译 0 错误**（Linux/ARM64 同过）。
+- **全引擎决策点外接**：主阶段/战斗/连锁/是否/选项/先后手/多选选卡（祭品·反选·凑和）/表示形式/放置区域/宣言数字；`Apply` 与引擎响应 `ToValue` 逐项一致（自测 27 项）。排序/指示物/宣言卡名属性种族暂由内置 AI 处理。
+- **房间生命周期门控**：自动 ready/start 改为显式 `/ready` `/start`；自定义卡组直接用上游 `DeckFile`（不会被随机替换）；支持投降/聊天/胜负与公开日志。
+- **一键自动安装**：`plugin/scripts/install_ygo_bridge.{ps1,sh}` + 配置页「⬇ 一键安装/更新桥」「▶ 启动」（后台安装、日志、健康检查、启停）。已实测从零安装→自测→启动全通过。
+- **容错**：桥未接管/决策超时(默认 110s)/异常时回退内置 AI，对局不卡死；多选数量与索引由桥校验。
+- **合规**：上游 AGPL-3.0 的 LICENSE/COPYING 保留，附 `NOTICE.md`（来源、修改清单、许可）；插件与桥 HTTP 解耦。
+- **验证边界**：Linux/.NET 8 编译、27 项引擎语义自测、HTTP 契约、插件 11 项安装器测试均通过；**公共服实战需在 Windows 按指南实测**（沙箱无法访问公共服务器）。
 
 ### v1.1.0（YGO 网络对战全链路 + 无 Jev 主 LLM 可玩）
 
